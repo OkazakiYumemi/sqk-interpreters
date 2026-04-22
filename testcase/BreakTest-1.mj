@@ -1,0 +1,11 @@
+{
+    int i = 0;
+    while (true) {
+        int x = 5;
+        {
+            int y = 10;
+            break;
+        }
+    }
+    continue;
+}

@@ -24,11 +24,7 @@ public class Main {
         parser.addErrorListener(ThrowingErrorListener.INSTANCE);
 
         ParseTree pt = parser.compilationUnit();
-        Value result = new EvalVisitor().visit(pt);
-        if (result == null) {
-            throw new EvalException("Evaluation result is null.");
-        }
-        System.out.print(result.displayString());
+        new EvalVisitor().visit(pt);
     }
 
 

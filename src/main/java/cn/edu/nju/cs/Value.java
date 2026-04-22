@@ -36,6 +36,15 @@ final class Value {
         return kind;
     }
 
+    static String kindName(Kind kind) {
+        return switch (kind) {
+            case INT -> "int";
+            case CHAR -> "char";
+            case BOOLEAN -> "boolean";
+            case STRING -> "string";
+        };
+    }
+
     boolean isIntegral() {
         return kind == Kind.INT || kind == Kind.CHAR;
     }

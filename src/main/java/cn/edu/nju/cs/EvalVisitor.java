@@ -1,9 +1,230 @@
 package cn.edu.nju.cs;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
+    private static final class BreakSignal extends RuntimeException {
+    }
+
+    private static final class ContinueSignal extends RuntimeException {
+    }
+
+    private static final class VariableBinding {
+        private final Value.Kind declaredType;
+        private Value value;
+
+        private VariableBinding(Value.Kind declaredType, Value value) {
+            this.declaredType = declaredType;
+            this.value = value;
+        }
+    }
+
+    private static final class ScopeFrame {
+        private final int depth;
+        private final Map<String, VariableBinding> variables = new HashMap<>();
+
+        private ScopeFrame(int depth) {
+            this.depth = depth;
+        }
+    }
+
+    private final Deque<ScopeFrame> scopeStack = new ArrayDeque<>();
+    private int loopDepth = 0;
+
     @Override
     public Value visitCompilationUnit(MiniJavaParser.CompilationUnitContext ctx) {
-        return visit(ctx.expression());
+        visit(ctx.block());
+        return null;
+    }
+
+    @Override
+    public Value visitBlock(MiniJavaParser.BlockContext ctx) {
+        enterScope();
+        try {
+            for (MiniJavaParser.BlockStatementContext blockStatementContext : ctx.blockStatement()) {
+                visit(blockStatementContext);
+            }
+            exitScope();
+            return null;
+        } catch (RuntimeException ex) {
+            handleScopeExitOnException(ex);
+            throw ex;
+        }
+    }
+
+    @Override
+    public Value visitBlockStatement(MiniJavaParser.BlockStatementContext ctx) {
+        if (ctx.localVariableDeclaration() != null) {
+            visit(ctx.localVariableDeclaration());
+            return null;
+        }
+        return visit(ctx.statement());
+    }
+
+    @Override
+    public Value visitLocalVariableDeclaration(MiniJavaParser.LocalVariableDeclarationContext ctx) {
+        Value.Kind declaredType = parsePrimitiveType(ctx.primitiveType().getText());
+        String identifier = ctx.identifier().getText();
+        ScopeFrame scope = currentScope();
+
+        if (scope.variables.containsKey(identifier)) {
+            throw new EvalException("Variable already declared in current scope: " + identifier);
+        }
+
+        Value value;
+        if (ctx.expression() == null) {
+            value = defaultValueForType(declaredType);
+        } else {
+            Value rhs = visit(ctx.expression());
+            value = applySimpleAssignment(declaredType, rhs);
+        }
+
+        scope.variables.put(identifier, new VariableBinding(declaredType, value));
+        return null;
+    }
+
+    @Override
+    public Value visitStatement(MiniJavaParser.StatementContext ctx) {
+        if (ctx.block() != null) {
+            return visit(ctx.block());
+        }
+
+        if (ctx.IF() != null) {
+            boolean condition = requireBoolean(visit(ctx.parExpression().expression()));
+            if (condition) {
+                return visit(ctx.statement(0));
+            }
+
+            if (ctx.ELSE() != null) {
+                return visit(ctx.statement(1));
+            }
+
+            return null;
+        }
+
+        if (ctx.WHILE() != null) {
+            return evalWhileStatement(ctx);
+        }
+
+        if (ctx.FOR() != null) {
+            return evalForStatement(ctx);
+        }
+
+        if (ctx.BREAK() != null) {
+            ensureInsideLoop("break");
+            throw new BreakSignal();
+        }
+
+        if (ctx.CONTINUE() != null) {
+            ensureInsideLoop("continue");
+            throw new ContinueSignal();
+        }
+
+        if (ctx.expression() != null) {
+            visit(ctx.expression());
+            return null;
+        }
+
+        return null;
+    }
+
+    private Value evalWhileStatement(MiniJavaParser.StatementContext ctx) {
+        loopDepth++;
+        try {
+            while (requireBoolean(visit(ctx.parExpression().expression()))) {
+                try {
+                    visit(ctx.statement(0));
+                } catch (ContinueSignal signal) {
+                    continue;
+                } catch (BreakSignal signal) {
+                    break;
+                }
+            }
+            return null;
+        } finally {
+            loopDepth--;
+        }
+    }
+
+    private Value evalForStatement(MiniJavaParser.StatementContext ctx) {
+        MiniJavaParser.ForControlContext control = ctx.forControl();
+        // boolean hasImplicitScope = hasForImplicitScope(control);
+        // if (hasImplicitScope) {
+        //     enterScope();
+        // }
+        enterScope();
+        loopDepth++;
+        try {
+            executeForInit(control);
+            while (evaluateForCondition(control)) {
+                try {
+                    visit(ctx.statement(0));
+                } catch (ContinueSignal signal) {
+                    executeForUpdate(control);
+                    continue;
+                } catch (BreakSignal signal) {
+                    break;
+                }
+                executeForUpdate(control);
+            }
+            // if (hasImplicitScope) {
+            //     exitScope();
+            // }
+            exitScope();
+            return null;
+        } catch (RuntimeException ex) {
+            // if (hasImplicitScope) {
+            //     handleScopeExitOnException(ex);
+            // }
+            handleScopeExitOnException(ex);
+            throw ex;
+        } finally {
+            loopDepth--;
+        }
+    }
+
+    private boolean hasForImplicitScope(MiniJavaParser.ForControlContext control) {
+        return control.forInit() != null && control.forInit().localVariableDeclaration() != null;
+    }
+
+    private void ensureInsideLoop(String keyword) {
+        if (loopDepth <= 0) {
+            throw new EvalException(keyword + " can only be used inside loops.");
+        }
+    }
+
+    private void executeForInit(MiniJavaParser.ForControlContext control) {
+        if (control.forInit() != null) {
+            visit(control.forInit());
+        }
+    }
+
+    private boolean evaluateForCondition(MiniJavaParser.ForControlContext control) {
+        if (control.expression() == null) {
+            return true;
+        }
+        return requireBoolean(visit(control.expression()));
+    }
+
+    private void executeForUpdate(MiniJavaParser.ForControlContext control) {
+        if (control.expressionList() != null) {
+            visit(control.expressionList());
+        }
+    }
+
+    @Override
+    public Value visitExpressionList(MiniJavaParser.ExpressionListContext ctx) {
+        Value result = null;
+        for (MiniJavaParser.ExpressionContext expressionContext : ctx.expression()) {
+            result = visit(expressionContext);
+        }
+        return result;
     }
 
     @Override
@@ -11,37 +232,43 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (ctx.literal() != null) {
             return visit(ctx.literal());
         }
+
+        if (ctx.identifier() != null) {
+            return resolveVariable(ctx.identifier().getText()).value;
+        }
+
         return visit(ctx.expression());
     }
 
     @Override
     public Value visitLiteral(MiniJavaParser.LiteralContext ctx) {
         if (ctx.DECIMAL_LITERAL() != null) {
-            String text = ctx.DECIMAL_LITERAL().getText().replace("_", "");
-            try {
-                return Value.ofInt(Integer.parseInt(text));
-            } catch (NumberFormatException ex) {
-                throw new EvalException("Invalid integer literal: " + text, ex);
-            }
+            return Value.ofInt(parseDecimalLiteral(ctx.DECIMAL_LITERAL().getText()));
         }
 
         if (ctx.BOOL_LITERAL() != null) {
             return Value.ofBoolean(Boolean.parseBoolean(ctx.BOOL_LITERAL().getText()));
         }
+        
+        if (ctx.CHAR_LITERAL() != null) {
+            String raw = ctx.CHAR_LITERAL().getText();
+            String content = raw.substring(1, raw.length() - 1);
+            String decoded = unescape(content);
+            if (decoded.length() != 1) {
+                throw new EvalException("Invalid char literal.");
+            }
+            return Value.ofChar(decoded.charAt(0));
+        }
 
         if (ctx.STRING_LITERAL() != null) {
             String raw = ctx.STRING_LITERAL().getText();
-            return Value.ofString(raw.substring(1, raw.length() - 1));
+            String content = raw.substring(1, raw.length() - 1);
+            return Value.ofString(unescape(content));
         }
 
-        if (ctx.CHAR_LITERAL() != null) {
-            String raw = ctx.CHAR_LITERAL().getText();
-            String body = raw.substring(1, raw.length() - 1);
-            if (body.length() != 1) {
-                throw new EvalException("Only simple char literals are supported.");
-            }
-            return Value.ofChar(body.charAt(0));
-        }
+        // if (ctx.NULL_LITERAL() != null) {
+        //     throw new EvalException("Null literal is unsupported.");
+        // }
 
         throw new EvalException("Unknown literal node.");
     }
@@ -53,12 +280,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
 
         if (ctx.postfix != null) {
-            throw new EvalException("Postfix ++/-- is invalid in this lab.");
+            return evalIncDec(ctx.expression(0), ctx.postfix.getType() == MiniJavaParser.INC, true);
         }
 
         if (ctx.prefix != null) {
+            int op = ctx.prefix.getType();
+            if (op == MiniJavaParser.INC || op == MiniJavaParser.DEC) {
+                return evalIncDec(ctx.expression(0), op == MiniJavaParser.INC, false);
+            }
             Value operand = visit(ctx.expression(0));
-            return evalPrefix(ctx.prefix.getType(), operand);
+            return evalPrefix(op, operand);
         }
 
         if (ctx.primitiveType() != null) {
@@ -81,6 +312,10 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 return evalOr(ctx);
             }
 
+            if (isAssignmentOperator(op)) {
+                return evalAssignment(ctx);
+            }
+
             Value left = visit(ctx.expression(0));
             Value right = visit(ctx.expression(1));
             return evalBinary(op, left, right);
@@ -95,9 +330,22 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             case MiniJavaParser.SUB -> Value.ofInt(-requireIntegral(operand));
             case MiniJavaParser.BANG -> Value.ofBoolean(!requireBoolean(operand));
             case MiniJavaParser.TILDE -> Value.ofInt(~requireIntegral(operand));
-            case MiniJavaParser.INC, MiniJavaParser.DEC -> throw new EvalException("Prefix ++/-- is invalid in this lab.");
             default -> throw new EvalException("Unsupported prefix operator.");
         };
+    }
+
+    private Value evalIncDec(MiniJavaParser.ExpressionContext target, boolean increment, boolean postfix) {
+        VariableBinding variable = resolveVariable(extractAssignableName(target));
+        if (!isIntegralType(variable.declaredType)) {
+            throw new EvalException("++/-- requires int or char.");
+        }
+
+        Value original = variable.value;
+        int delta = increment ? 1 : -1;
+        int updated = original.asIntegral() + delta;
+        Value updatedValue = castIntegralToTarget(variable.declaredType, updated);
+        variable.value = updatedValue;
+        return postfix ? original : updatedValue;
     }
 
     private Value evalCast(String typeName, Value operand) {
@@ -135,6 +383,109 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         return Value.ofBoolean(right);
     }
 
+    private Value evalAssignment(MiniJavaParser.ExpressionContext ctx) {
+        VariableBinding variable = resolveVariable(extractAssignableName(ctx.expression(0)));
+        Value rhs = visit(ctx.expression(1));
+        Value assigned = applyAssignment(variable.declaredType, variable.value, ctx.bop.getType(), rhs);
+        variable.value = assigned;
+        return assigned;
+    }
+
+    private Value applyAssignment(Value.Kind targetType, Value currentValue, int operator, Value rhs) {
+        if (operator == MiniJavaParser.ASSIGN) {
+            return applySimpleAssignment(targetType, rhs);
+        }
+
+        if (targetType == Value.Kind.STRING) {
+            if (operator != MiniJavaParser.ADD_ASSIGN) {
+                throw new EvalException("Only = and += are valid for string.");
+            }
+            return Value.ofString(currentValue.asString() + rhs.toConcatString());
+        }
+
+        if (targetType == Value.Kind.BOOLEAN) {
+            if (rhs.kind() != Value.Kind.BOOLEAN) {
+                throw new EvalException("Type mismatch for boolean assignment.");
+            }
+
+            boolean left = currentValue.asBoolean();
+            boolean right = rhs.asBoolean();
+
+            return switch (operator) {
+                case MiniJavaParser.AND_ASSIGN -> Value.ofBoolean(left & right);
+                case MiniJavaParser.OR_ASSIGN -> Value.ofBoolean(left | right);
+                case MiniJavaParser.XOR_ASSIGN -> Value.ofBoolean(left ^ right);
+                default -> throw new EvalException("Only =, &=, |=, ^= are valid for boolean.");
+            };
+        }
+
+        if (!isIntegralType(targetType)) {
+            throw new EvalException("Invalid assignment target type.");
+        }
+
+        int left = currentValue.asIntegral();
+        int right = requireIntegral(rhs);
+
+        int result = switch (operator) {
+            case MiniJavaParser.ADD_ASSIGN -> left + right;
+            case MiniJavaParser.SUB_ASSIGN -> left - right;
+            case MiniJavaParser.MUL_ASSIGN -> left * right;
+            case MiniJavaParser.DIV_ASSIGN -> {
+                if (right == 0) {
+                    throw new EvalException("Division by zero.");
+                }
+                yield left / right;
+            }
+            case MiniJavaParser.MOD_ASSIGN -> {
+                if (right == 0) {
+                    throw new EvalException("Modulo by zero.");
+                }
+                yield left % right;
+            }
+            case MiniJavaParser.AND_ASSIGN -> left & right;
+            case MiniJavaParser.OR_ASSIGN -> left | right;
+            case MiniJavaParser.XOR_ASSIGN -> left ^ right;
+            case MiniJavaParser.LSHIFT_ASSIGN -> left << right;
+            case MiniJavaParser.RSHIFT_ASSIGN -> left >> right;
+            case MiniJavaParser.URSHIFT_ASSIGN -> left >>> right;
+            default -> throw new EvalException("Unsupported assignment operator.");
+        };
+
+        return castIntegralToTarget(targetType, result);
+    }
+
+    private Value applySimpleAssignment(Value.Kind targetType, Value rhs) {
+        if (targetType == Value.Kind.INT) {
+            if (!rhs.isIntegral()) {
+                throw new EvalException("Type mismatch for int assignment.");
+            }
+            return Value.ofInt(rhs.asIntegral());
+        }
+
+        if (targetType == Value.Kind.CHAR) {
+            if (!rhs.isIntegral()) {
+                throw new EvalException("Type mismatch for char assignment.");
+            }
+            return Value.ofChar(rhs.asIntegral());
+        }
+
+        if (targetType == Value.Kind.BOOLEAN) {
+            if (rhs.kind() != Value.Kind.BOOLEAN) {
+                throw new EvalException("Type mismatch for boolean assignment.");
+            }
+            return rhs;
+        }
+
+        if (targetType == Value.Kind.STRING) {
+            if (rhs.kind() != Value.Kind.STRING) {
+                throw new EvalException("Type mismatch for string assignment.");
+            }
+            return rhs;
+        }
+
+        throw new EvalException("Unsupported assignment target type.");
+    }
+
     private Value evalBinary(int op, Value left, Value right) {
         return switch (op) {
             case MiniJavaParser.MUL -> Value.ofInt(requireIntegral(left) * requireIntegral(right));
@@ -151,23 +502,32 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             case MiniJavaParser.GE -> Value.ofBoolean(requireIntegral(left) >= requireIntegral(right));
             case MiniJavaParser.EQUAL -> evalEquality(left, right, true);
             case MiniJavaParser.NOTEQUAL -> evalEquality(left, right, false);
-            case MiniJavaParser.BITAND -> Value.ofInt(requireIntegral(left) & requireIntegral(right));
-            case MiniJavaParser.CARET -> Value.ofInt(requireIntegral(left) ^ requireIntegral(right));
-            case MiniJavaParser.BITOR -> Value.ofInt(requireIntegral(left) | requireIntegral(right));
-            case MiniJavaParser.ASSIGN,
-                MiniJavaParser.ADD_ASSIGN,
-                MiniJavaParser.SUB_ASSIGN,
-                MiniJavaParser.MUL_ASSIGN,
-                MiniJavaParser.DIV_ASSIGN,
-                MiniJavaParser.AND_ASSIGN,
-                MiniJavaParser.OR_ASSIGN,
-                MiniJavaParser.XOR_ASSIGN,
-                MiniJavaParser.RSHIFT_ASSIGN,
-                MiniJavaParser.URSHIFT_ASSIGN,
-                MiniJavaParser.LSHIFT_ASSIGN,
-                MiniJavaParser.MOD_ASSIGN -> throw new EvalException("Assignment operators are unsupported in this lab.");
+            case MiniJavaParser.BITAND -> evalBitAnd(left, right);
+            case MiniJavaParser.CARET -> evalBitXor(left, right);
+            case MiniJavaParser.BITOR -> evalBitOr(left, right);
             default -> throw new EvalException("Unsupported operator.");
         };
+    }
+
+    private Value evalBitAnd(Value left, Value right) {
+        if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
+            return Value.ofBoolean(left.asBoolean() & right.asBoolean());
+        }
+        return Value.ofInt(requireIntegral(left) & requireIntegral(right));
+    }
+
+    private Value evalBitOr(Value left, Value right) {
+        if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
+            return Value.ofBoolean(left.asBoolean() | right.asBoolean());
+        }
+        return Value.ofInt(requireIntegral(left) | requireIntegral(right));
+    }
+
+    private Value evalBitXor(Value left, Value right) {
+        if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
+            return Value.ofBoolean(left.asBoolean() ^ right.asBoolean());
+        }
+        return Value.ofInt(requireIntegral(left) ^ requireIntegral(right));
     }
 
     private Value evalDiv(Value left, Value right) {
@@ -214,6 +574,187 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
 
         return Value.ofBoolean(isEqual ? result : !result);
+    }
+
+    private int parseDecimalLiteral(String raw) {
+        String normalized = raw.replace("_", "");
+        if (normalized.endsWith("l") || normalized.endsWith("L")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+
+        try {
+            long parsed = Long.parseLong(normalized);
+            if (parsed < Integer.MIN_VALUE || parsed > Integer.MAX_VALUE) {
+                throw new EvalException("Integer literal out of range: " + raw);
+            }
+            return (int) parsed;
+        } catch (NumberFormatException ex) {
+            throw new EvalException("Invalid integer literal: " + raw, ex);
+        }
+    }
+
+    private String unescape(String text) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c != '\\') {
+                builder.append(c);
+                continue;
+            }
+
+            if (i + 1 >= text.length()) {
+                throw new EvalException("Invalid escape sequence.");
+            }
+
+            char escaped = text.charAt(++i);
+            switch (escaped) {
+                case 'b' -> builder.append('\b');
+                case 't' -> builder.append('\t');
+                case 'n' -> builder.append('\n');
+                case 'f' -> builder.append('\f');
+                case 'r' -> builder.append('\r');
+                case '"' -> builder.append('"');
+                case '\'' -> builder.append('\'');
+                case '\\' -> builder.append('\\');
+                case 'u' -> {
+                    int u = i;
+                    while (u < text.length() && text.charAt(u) == 'u') {
+                        u++;
+                    }
+                    if (u + 4 > text.length()) {
+                        throw new EvalException("Invalid unicode escape sequence.");
+                    }
+                    String hex = text.substring(u, u + 4);
+                    try {
+                        builder.append((char) Integer.parseInt(hex, 16));
+                    } catch (NumberFormatException ex) {
+                        throw new EvalException("Invalid unicode escape sequence.", ex);
+                    }
+                    i = u + 3;
+                }
+                default -> {
+                    if (escaped < '0' || escaped > '7') {
+                        throw new EvalException("Invalid escape sequence.");
+                    }
+                    int value = escaped - '0';
+                    int consumed = 1;
+                    while (consumed < 3 && i + 1 < text.length()) {
+                        char next = text.charAt(i + 1);
+                        if (next < '0' || next > '7') {
+                            break;
+                        }
+                        value = (value << 3) + (next - '0');
+                        i++;
+                        consumed++;
+                    }
+                    builder.append((char) value);
+                }
+            }
+        }
+        return builder.toString();
+    }
+
+    private String extractAssignableName(MiniJavaParser.ExpressionContext expressionContext) {
+        if (expressionContext.primary() != null && expressionContext.primary().identifier() != null) {
+            return expressionContext.primary().identifier().getText();
+        }
+        throw new EvalException("Left-hand side must be an identifier.");
+    }
+
+    private void enterScope() {
+        scopeStack.push(new ScopeFrame(scopeStack.size()));
+    }
+
+    private void exitScope() {
+        ScopeFrame scope = scopeStack.pop();
+        printScope(scope);
+    }
+
+    private void discardScope() {
+        scopeStack.pop();
+    }
+
+    private void handleScopeExitOnException(RuntimeException ex) {
+        if (ex instanceof BreakSignal || ex instanceof ContinueSignal) {
+            exitScope();
+            return;
+        }
+        discardScope();
+    }
+
+    private void printScope(ScopeFrame scope) {
+        List<String> names = new ArrayList<>(scope.variables.keySet());
+        Collections.sort(names);
+        for (String name : names) {
+            VariableBinding variable = scope.variables.get(name);
+            System.out.println(
+                "Scope " + scope.depth + ": " + name + ": (" + Value.kindName(variable.declaredType) + ") " + variable.value.displayString()
+            );
+        }
+    }
+
+    private ScopeFrame currentScope() {
+        ScopeFrame scope = scopeStack.peek();
+        if (scope == null) {
+            throw new EvalException("No active scope.");
+        }
+        return scope;
+    }
+
+    private VariableBinding resolveVariable(String identifier) {
+        for (ScopeFrame scope : scopeStack) {
+            VariableBinding variable = scope.variables.get(identifier);
+            if (variable != null) {
+                return variable;
+            }
+        }
+        throw new EvalException("Undeclared variable: " + identifier);
+    }
+
+    private Value.Kind parsePrimitiveType(String type) {
+        return switch (type) {
+            case "int" -> Value.Kind.INT;
+            case "char" -> Value.Kind.CHAR;
+            case "boolean" -> Value.Kind.BOOLEAN;
+            case "string" -> Value.Kind.STRING;
+            default -> throw new EvalException("Unsupported type: " + type);
+        };
+    }
+
+    private Value defaultValueForType(Value.Kind kind) {
+        return switch (kind) {
+            case INT -> Value.ofInt(0);
+            case CHAR -> Value.ofChar(0);
+            case BOOLEAN -> Value.ofBoolean(false);
+            case STRING -> Value.ofString("");
+        };
+    }
+
+    private boolean isIntegralType(Value.Kind kind) {
+        return kind == Value.Kind.INT || kind == Value.Kind.CHAR;
+    }
+
+    private Value castIntegralToTarget(Value.Kind targetType, int value) {
+        return switch (targetType) {
+            case INT -> Value.ofInt(value);
+            case CHAR -> Value.ofChar(value);
+            default -> throw new EvalException("Target type is not integral.");
+        };
+    }
+
+    private boolean isAssignmentOperator(int op) {
+        return op == MiniJavaParser.ASSIGN
+            || op == MiniJavaParser.ADD_ASSIGN
+            || op == MiniJavaParser.SUB_ASSIGN
+            || op == MiniJavaParser.MUL_ASSIGN
+            || op == MiniJavaParser.DIV_ASSIGN
+            || op == MiniJavaParser.MOD_ASSIGN
+            || op == MiniJavaParser.AND_ASSIGN
+            || op == MiniJavaParser.OR_ASSIGN
+            || op == MiniJavaParser.XOR_ASSIGN
+            || op == MiniJavaParser.LSHIFT_ASSIGN
+            || op == MiniJavaParser.RSHIFT_ASSIGN
+            || op == MiniJavaParser.URSHIFT_ASSIGN;
     }
 
     private int requireIntegral(Value value) {
