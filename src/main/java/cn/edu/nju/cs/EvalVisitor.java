@@ -189,9 +189,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
     }
 
-    private boolean hasForImplicitScope(MiniJavaParser.ForControlContext control) {
-        return control.forInit() != null && control.forInit().localVariableDeclaration() != null;
-    }
+    // private boolean hasForImplicitScope(MiniJavaParser.ForControlContext control) {
+    //     return control.forInit() != null && control.forInit().localVariableDeclaration() != null;
+    // }
 
     private void ensureInsideLoop(String keyword) {
         if (loopDepth <= 0) {
@@ -510,23 +510,23 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     }
 
     private Value evalBitAnd(Value left, Value right) {
-        if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
-            return Value.ofBoolean(left.asBoolean() & right.asBoolean());
-        }
+        // if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
+        //     return Value.ofBoolean(left.asBoolean() & right.asBoolean());
+        // }
         return Value.ofInt(requireIntegral(left) & requireIntegral(right));
     }
 
     private Value evalBitOr(Value left, Value right) {
-        if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
-            return Value.ofBoolean(left.asBoolean() | right.asBoolean());
-        }
+        // if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
+        //     return Value.ofBoolean(left.asBoolean() | right.asBoolean());
+        // }
         return Value.ofInt(requireIntegral(left) | requireIntegral(right));
     }
 
     private Value evalBitXor(Value left, Value right) {
-        if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
-            return Value.ofBoolean(left.asBoolean() ^ right.asBoolean());
-        }
+        // if (left.kind() == Value.Kind.BOOLEAN && right.kind() == Value.Kind.BOOLEAN) {
+        //     return Value.ofBoolean(left.asBoolean() ^ right.asBoolean());
+        // }
         return Value.ofInt(requireIntegral(left) ^ requireIntegral(right));
     }
 
@@ -594,64 +594,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     }
 
     private String unescape(String text) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c != '\\') {
-                builder.append(c);
-                continue;
-            }
-
-            if (i + 1 >= text.length()) {
-                throw new EvalException("Invalid escape sequence.");
-            }
-
-            char escaped = text.charAt(++i);
-            switch (escaped) {
-                case 'b' -> builder.append('\b');
-                case 't' -> builder.append('\t');
-                case 'n' -> builder.append('\n');
-                case 'f' -> builder.append('\f');
-                case 'r' -> builder.append('\r');
-                case '"' -> builder.append('"');
-                case '\'' -> builder.append('\'');
-                case '\\' -> builder.append('\\');
-                case 'u' -> {
-                    int u = i;
-                    while (u < text.length() && text.charAt(u) == 'u') {
-                        u++;
-                    }
-                    if (u + 4 > text.length()) {
-                        throw new EvalException("Invalid unicode escape sequence.");
-                    }
-                    String hex = text.substring(u, u + 4);
-                    try {
-                        builder.append((char) Integer.parseInt(hex, 16));
-                    } catch (NumberFormatException ex) {
-                        throw new EvalException("Invalid unicode escape sequence.", ex);
-                    }
-                    i = u + 3;
-                }
-                default -> {
-                    if (escaped < '0' || escaped > '7') {
-                        throw new EvalException("Invalid escape sequence.");
-                    }
-                    int value = escaped - '0';
-                    int consumed = 1;
-                    while (consumed < 3 && i + 1 < text.length()) {
-                        char next = text.charAt(i + 1);
-                        if (next < '0' || next > '7') {
-                            break;
-                        }
-                        value = (value << 3) + (next - '0');
-                        i++;
-                        consumed++;
-                    }
-                    builder.append((char) value);
-                }
-            }
-        }
-        return builder.toString();
+        return text; // We don't have escaped char, e.g., '\n', in a string. A string can be empty, i.e., "".
+        // 2.1 of Lab 1 - Expression Interpreter
     }
 
     private String extractAssignableName(MiniJavaParser.ExpressionContext expressionContext) {
