@@ -3,5 +3,5 @@ target
 .idea
 *.antlr
 submission.zip
-work.pdf
+labs/*.pdf
 *-ver/
