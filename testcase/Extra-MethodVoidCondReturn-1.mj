@@ -1,0 +1,13 @@
+// Methods edge: void return in conditional
+void maybeReturn(int x) {
+    if (x > 0) {
+        return;
+    }
+    println(x);
+}
+
+int main() {
+    maybeReturn(5);
+    maybeReturn(0);
+    return 0;
+}

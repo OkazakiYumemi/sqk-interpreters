@@ -1,0 +1,10 @@
+// Non-void method missing return (should error)
+int foo() {
+    int x = 5;
+    // no return!
+}
+
+int main() {
+    foo();
+    return 0;
+}

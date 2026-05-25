@@ -1,0 +1,7 @@
+// Void method used in expression
+void doNothing() { }
+
+int main() {
+    int x = doNothing();
+    return x;
+}

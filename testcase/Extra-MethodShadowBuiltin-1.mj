@@ -1,0 +1,13 @@
+// User-defined method same name as built-in
+int print(int x) {
+    return x + 100;
+}
+
+int main() {
+    // print(5) - should call user-defined or built-in?
+    // Built-in has priority, so this calls built-in print
+    // which prints "5" with no newline
+    print(5);
+    println();
+    return 0;
+}

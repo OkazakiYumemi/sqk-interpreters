@@ -1,0 +1,5 @@
+// Type error: assign int to string
+int main() {
+    string s = 123;
+    return 0;
+}

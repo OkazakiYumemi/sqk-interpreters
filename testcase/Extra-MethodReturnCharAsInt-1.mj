@@ -1,0 +1,9 @@
+// Return type mismatch: int method returns char (should this work?)
+int foo() {
+    return 'a';
+}
+
+int main() {
+    println(foo());
+    return 0;
+}

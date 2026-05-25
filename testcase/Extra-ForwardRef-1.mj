@@ -1,0 +1,13 @@
+// Forward reference test: main calls foo before foo is defined
+int main() {
+    println(foo(5));
+    return 0;
+}
+
+int foo(int x) {
+    return bar(x);
+}
+
+int bar(int x) {
+    return x * 2;
+}

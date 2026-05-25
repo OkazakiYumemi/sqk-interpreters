@@ -1,0 +1,9 @@
+// NP edge case: null pointer through method return chain
+int[] getNull() {
+    return null;
+}
+
+int main() {
+    int x = getNull()[0];  // null pointer
+    return x;
+}

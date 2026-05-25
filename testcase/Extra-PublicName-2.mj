@@ -1,0 +1,9 @@
+// Method named "public" - just declare it, don't call
+int public() {
+    return 42;
+}
+
+int main() {
+    println(100);
+    return 0;
+}

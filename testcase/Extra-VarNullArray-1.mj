@@ -1,0 +1,8 @@
+// Var edge case: var from array element that's null (e.g., jagged array)
+int main() {
+    int[][] a = new int[2][];
+    a[0] = new int[] {1, 2};
+    var x = a[1];  // a[1] is null - should this infer as int[]?
+    println(x);
+    return 0;
+}

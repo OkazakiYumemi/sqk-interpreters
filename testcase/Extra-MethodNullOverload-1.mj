@@ -1,0 +1,8 @@
+// Methods: overload with null literal arg to different array types
+void bar(int[] a) { println(1); }
+void bar(char[] a) { println(2); }
+
+int main() {
+    bar(null);  // ambiguous? Both null→int[] and null→char[] cost 1
+    return 0;
+}

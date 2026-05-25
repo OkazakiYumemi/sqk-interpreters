@@ -1,0 +1,9 @@
+// Void method with return value (should error)
+void foo() {
+    return 5;
+}
+
+int main() {
+    foo();
+    return 0;
+}

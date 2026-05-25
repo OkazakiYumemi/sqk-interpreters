@@ -1,0 +1,11 @@
+// Method overload with array dimensions
+void foo(int[] a) { println(1); }
+void foo(int[][] a) { println(2); }
+
+int main() {
+    int[] a1 = {1,2};
+    int[][] a2 = {{1,2},{3,4}};
+    foo(a1);
+    foo(a2);
+    return 0;
+}

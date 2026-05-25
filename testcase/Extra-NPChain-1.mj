@@ -1,0 +1,7 @@
+// NP: accessing element of null returned by method, chained
+int[] getArr() { return null; }
+
+int main() {
+    int x = getArr()[0];  // null pointer
+    return x;
+}

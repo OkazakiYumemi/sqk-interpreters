@@ -1,0 +1,8 @@
+int getInt() {
+    return 65;  // This is a decimal literal, but returns as plain int
+}
+
+int main() {
+    char c = getInt();  // Should be ILLEGAL per TA
+    return 0;
+}

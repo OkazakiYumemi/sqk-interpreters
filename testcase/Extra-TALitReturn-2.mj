@@ -1,0 +1,8 @@
+char getChar() {
+    return 65;  // DECIMAL_LITERAL -> char in return context: LEGAL
+}
+
+int main() {
+    println(getChar());  // Should print 'A'
+    return 0;
+}

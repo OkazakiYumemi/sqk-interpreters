@@ -1,0 +1,5 @@
+int main() {
+    int module = 5;
+    println(module);
+    return 0;
+}

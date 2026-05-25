@@ -1,0 +1,5 @@
+// Type error: boolean arithmetic
+int main() {
+    int x = true + 1;
+    return x;
+}

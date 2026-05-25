@@ -1,0 +1,9 @@
+// Cross-type array assignment tests
+int main() {
+    // Array type mismatch: int[] = char[]
+    int[] a1;
+    char[] a2 = {'a'};
+    a1 = a2;  // Should be type error!
+    
+    return 0;
+}

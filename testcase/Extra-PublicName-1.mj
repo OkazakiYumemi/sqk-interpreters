@@ -1,0 +1,9 @@
+// Method with same name as keyword "public"
+int public() {
+    return 42;
+}
+
+int main() {
+    println(public());
+    return 0;
+}

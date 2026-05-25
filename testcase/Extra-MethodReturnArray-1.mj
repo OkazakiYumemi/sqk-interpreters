@@ -1,0 +1,12 @@
+// Method returning array
+int[] makeArray() {
+    return new int[] {1, 2, 3};
+}
+
+int main() {
+    int[] arr = makeArray();
+    println(arr[0]);
+    println(arr[1]);
+    println(arr[2]);
+    return 0;
+}

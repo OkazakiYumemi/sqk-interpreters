@@ -1,0 +1,8 @@
+void public() {
+    println(42);
+}
+
+int main() {
+    public();
+    return 0;
+}
