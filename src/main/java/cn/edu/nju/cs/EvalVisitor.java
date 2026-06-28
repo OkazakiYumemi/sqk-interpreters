@@ -484,6 +484,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         // Built-ins
         if (methodName.equals("print") && args.size() == 1) {
             System.out.print(getDisplayString(args.get(0)));
+            System.out.flush();
             return null;
         }
         if (methodName.equals("println")) {
