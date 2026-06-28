@@ -1064,19 +1064,26 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         Value operand = visit(ctx.expression(0));
         String targetTypeName = ctx.typeType().getText();
 
-        // Static checks: both must be class types in the same inheritance tree
-        // decl(obj) must be a class type
+        // Static check: TargetType must be a class type (must check before null)
+        if (!classes.containsKey(targetTypeName)) {
+            // e.g., obj instanceof int[] → type error
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        // For null, check inheritance tree before returning false
         if (operand.kind() == Value.Kind.NULL) {
-            // null instanceof C → false (null is not an instance of any class)
+            String nullDeclType = operand.getTypeName();
+            if (!"null".equals(nullDeclType) && classes.containsKey(nullDeclType)) {
+                if (!isSameInheritanceTree(nullDeclType, targetTypeName)) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+            }
             return Value.ofBoolean(false);
         }
         if (operand.kind() != Value.Kind.CLASS) {
             // e.g., arr instanceof C where arr is int[] → type error
-            System.out.println("Process exits with 34.");
-            System.exit(34);
-        }
-        if (!classes.containsKey(targetTypeName)) {
-            // TargetType must be a class type (e.g., obj instanceof int[] → type error)
             System.out.println("Process exits with 34.");
             System.exit(34);
         }
