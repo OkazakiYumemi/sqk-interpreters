@@ -2518,7 +2518,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (best != null) return best;
 
         // No matching explicit constructor → use implicit default if args is empty
-        if (args.isEmpty()) {
+        // BUT: if the class has explicit constructors, no implicit default is generated
+        if (args.isEmpty() && !ci.hasExplicitConstructor) {
             return null; // signal to use implicit default constructor
         }
 
