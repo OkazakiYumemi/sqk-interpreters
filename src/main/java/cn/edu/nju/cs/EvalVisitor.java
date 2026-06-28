@@ -1138,6 +1138,21 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
     private Value evalAssignment(MiniJavaParser.ExpressionContext ctx) {
         MiniJavaParser.ExpressionContext left = ctx.expression(0);
+
+        // For compound assignments to simple variables, snapshot current value
+        // BEFORE evaluating RHS (RHS may modify the same variable, e.g. a += (a = 3))
+        Value savedCurrent = null;
+        VariableBinding savedVar = null;
+        boolean isCompound = ctx.bop.getType() != MiniJavaParser.ASSIGN;
+        if (isCompound) {
+            // Check if left is a simple local variable
+            String varName = tryExtractSimpleName(left);
+            if (varName != null) {
+                savedVar = resolveVariableSilently(varName);
+                if (savedVar != null) savedCurrent = savedVar.value;
+            }
+        }
+
         Value rhs = visit(ctx.expression(1));
 
         // Array element assignment: arr[idx] = rhs or arr[idx] += rhs
@@ -1215,14 +1230,15 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
 
         // Simple variable assignment
-        VariableBinding variable = resolveVariable(extractAssignableName(left));
+        VariableBinding variable = savedVar != null ? savedVar : resolveVariable(extractAssignableName(left));
+        Value currentForOp = (savedCurrent != null) ? savedCurrent : variable.value;
         if (rhs.kind() == Value.Kind.ARRAY && variable.typeName.endsWith("[]")) {
             // Validate array type compatibility before assignment
             rhs = applyTypeCheckedAssignment(variable.typeName, rhs);
         } else if (rhs.kind() == Value.Kind.NULL && variable.typeName.endsWith("[]")) {
             rhs = Value.ofNull();
         }
-        Value assigned = applyAssignment(variable.declaredType, variable.value, ctx.bop.getType(), rhs);
+        Value assigned = applyAssignment(variable.declaredType, currentForOp, ctx.bop.getType(), rhs);
         variable.value = assigned;
         return assigned;
     }
@@ -1312,6 +1328,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (targetType == Value.Kind.STRING) {
             if (operator != MiniJavaParser.ADD_ASSIGN) {
                 throw new EvalException("Only = and += are valid for string.");
+            }
+            if (rhs.kind() == Value.Kind.NULL) {
+                throw new EvalException("Type error: string concatenation with null.");
             }
             return Value.ofString(currentValue.asString() + toConcatString(rhs));
         }
@@ -1487,6 +1506,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
     private Value evalAdd(Value left, Value right) {
         if (left.kind() == Value.Kind.STRING || right.kind() == Value.Kind.STRING) {
+            if (left.kind() == Value.Kind.NULL || right.kind() == Value.Kind.NULL) {
+                throw new EvalException("Type error: string concatenation with null.");
+            }
             return Value.ofString(toConcatString(left) + toConcatString(right));
         }
         return Value.ofInt(requireIntegral(left) + requireIntegral(right));
@@ -1580,6 +1602,23 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             return expressionContext.primary().identifier().getText();
         }
         throw new EvalException("Left-hand side must be an identifier.");
+    }
+
+    /** Try to extract a simple variable name from an expression, or null. */
+    private String tryExtractSimpleName(MiniJavaParser.ExpressionContext expr) {
+        if (expr.primary() != null && expr.primary().identifier() != null) {
+            return expr.primary().identifier().getText();
+        }
+        return null;
+    }
+
+    /** Resolve a variable without throwing if not found. Returns null if not found. */
+    private VariableBinding resolveVariableSilently(String identifier) {
+        for (ScopeFrame scope : scopeStack) {
+            VariableBinding variable = scope.variables.get(identifier);
+            if (variable != null) return variable;
+        }
+        return null;
     }
 
     private void enterScope() {
@@ -1828,8 +1867,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         // Same type → OK (non-integral, non-char)
         if (rhsType.equals(typeName)) return rhs;
 
-        // null → any array type
-        if (rhsType.equals("null") && typeName.endsWith("[]")) return Value.ofNull();
+        // null → any array type (preserve declared type)
+        if (rhsType.equals("null") && typeName.endsWith("[]")) return Value.ofNullTyped(typeName);
 
         // null → any class type (preserve declared type)
         if (rhsType.equals("null") && classes.containsKey(typeName)) return Value.ofNullTyped(typeName);
