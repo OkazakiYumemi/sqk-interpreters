@@ -1018,9 +1018,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
         // --- Class type casts ---
         if (classes.containsKey(typeName)) {
-            // (C) null → always null
+            // (C) null → always null (but typed as C for later assignment checks)
             if (operand.kind() == Value.Kind.NULL) {
-                return Value.ofNull();
+                return Value.ofNullTyped(typeName);
             }
 
             // Operand must be a class type
@@ -1242,8 +1242,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (rhs.kind() == Value.Kind.ARRAY && variable.typeName.endsWith("[]")) {
             // Validate array type compatibility before assignment
             rhs = applyTypeCheckedAssignment(variable.typeName, rhs);
-        } else if (rhs.kind() == Value.Kind.NULL && variable.typeName.endsWith("[]")) {
-            rhs = Value.ofNull();
+        } else if (rhs.kind() == Value.Kind.NULL && (variable.typeName.endsWith("[]") || classes.containsKey(variable.typeName))) {
+            // For null→array or null→class, run through type check to detect implicit downcast
+            rhs = applyTypeCheckedAssignment(variable.typeName, rhs);
         }
         Value assigned = applyAssignment(variable.declaredType, currentForOp, ctx.bop.getType(), rhs);
         variable.value = assigned;
@@ -1877,8 +1878,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         // null → any array type (preserve declared type)
         if (rhsType.equals("null") && typeName.endsWith("[]")) return Value.ofNullTyped(typeName);
 
-        // null → any class type (preserve declared type)
+        // null → any class type (preserve declared type, but check for implicit downcast)
         if (rhsType.equals("null") && classes.containsKey(typeName)) return Value.ofNullTyped(typeName);
+        // typed null (e.g. (A)null) → class type: check for implicit downcast
+        if (rhs.kind() == Value.Kind.NULL && classes.containsKey(rhsType)
+            && classes.containsKey(typeName)) {
+            if (getInheritanceDistance(typeName, rhsType) > 0) {
+                throw new EvalException("Type mismatch: implicit downcast not allowed.");
+            }
+            return Value.ofNullTyped(typeName);
+        }
 
         // Class type assignment: subclass → superclass (upcast) only
         // Implicit downcast (superclass → subclass) is NOT allowed
