@@ -632,11 +632,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (argType.equals("char") && formalParamType.equals("int")) return 1;
         if (argType.equals("null") && formalParamType.endsWith("[]")) return 1;
         if (argType.equals("null") && classes.containsKey(formalParamType)) return 1;
-        // Class upcast: subclass → superclass
+        // Class upcast: subclass → superclass (flat cost = 1 per spec)
         if (arg.kind() == Value.Kind.CLASS && classes.containsKey(argType)
             && classes.containsKey(formalParamType)) {
             int dist = getInheritanceDistance(argType, formalParamType);
-            if (dist >= 0) return dist;
+            if (dist >= 0) return 1; // all upcasts cost 1, not depth
         }
         return -1;
     }
@@ -681,6 +681,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             // Strip isDecimalLiteral: method parameters are not literals
             if (argVal.isDecimalLiteral()) {
                 argVal = Value.ofInt(argVal.asIntegral());
+            }
+            // Upcast class argument to declared parameter type (for proper overload resolution)
+            if (argVal.kind() == Value.Kind.CLASS && classes.containsKey(pTypeStr)
+                && !argVal.getTypeName().equals(pTypeStr)) {
+                argVal = Value.ofClassObjWithType(argVal.asClassObj(), pTypeStr);
             }
             Value.Kind declaredKind = resolveTypeKind(pTypeStr);
             currentScope().variables.put(pName, new VariableBinding(declaredKind, pTypeStr, argVal));
@@ -1158,6 +1163,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             else if (innerTypeName.startsWith("boolean")) elemKind = Value.Kind.BOOLEAN;
             else if (innerTypeName.startsWith("string")) elemKind = Value.Kind.STRING;
             else if (innerTypeName.contains("[]")) elemKind = Value.Kind.ARRAY;
+            else if (classes.containsKey(innerTypeName)) elemKind = Value.Kind.CLASS;
 
             Value assigned = applyAssignment(elemKind, currentVal, ctx.bop.getType(), rhs);
             elements[i] = assigned;
@@ -1295,7 +1301,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             if (operator != MiniJavaParser.ADD_ASSIGN) {
                 throw new EvalException("Only = and += are valid for string.");
             }
-            return Value.ofString(currentValue.asString() + rhs.toConcatString());
+            return Value.ofString(currentValue.asString() + toConcatString(rhs));
         }
 
         if (targetType == Value.Kind.BOOLEAN) {
@@ -1469,7 +1475,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
     private Value evalAdd(Value left, Value right) {
         if (left.kind() == Value.Kind.STRING || right.kind() == Value.Kind.STRING) {
-            return Value.ofString(left.toConcatString() + right.toConcatString());
+            return Value.ofString(toConcatString(left) + toConcatString(right));
         }
         return Value.ofInt(requireIntegral(left) + requireIntegral(right));
     }
@@ -1597,10 +1603,56 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
      * Get the display string for a value, handling class objects with to_string() dispatch.
      * For class objects: if the declared type has a suitable to_string() method,
      * invoke it via virtual dispatch (real type); otherwise return the class name.
+     * For arrays: format recursively with proper class element display.
      */
     private String getDisplayString(Value val) {
         if (val.kind() == Value.Kind.NULL) return "null";
+        if (val.kind() == Value.Kind.ARRAY) {
+            return formatArrayDisplay((Value[]) val.getValue());
+        }
         if (val.kind() != Value.Kind.CLASS) return val.displayString();
+
+        ObjectInstance obj = val.asClassObj();
+        if (obj == null) return "null";
+
+        String declType = val.getTypeName();
+        MiniJavaParser.MethodDeclarationContext toStringMethod = findToStringMethod(declType);
+
+        if (toStringMethod == null) {
+            return obj.className;
+        }
+
+        Value result = invokeToString(obj, toStringMethod);
+        if (result != null && result.kind() == Value.Kind.STRING) {
+            return result.asString();
+        }
+        return obj.className;
+    }
+
+    /** Format an array with proper recursive element display (including to_string for class elements). */
+    private String formatArrayDisplay(Value[] arr) {
+        if (arr == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        sb.append("[");
+        for (int i = 0; i < arr.length; i++) {
+            if (arr[i] == null) {
+                sb.append("null");
+            } else {
+                sb.append(getDisplayString(arr[i]));
+            }
+            if (i < arr.length - 1) sb.append(", ");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /** Format a value for string concatenation, handling class objects with to_string() dispatch. */
+    private String toConcatString(Value val) {
+        if (val.kind() == Value.Kind.NULL) return "null";
+        if (val.kind() == Value.Kind.ARRAY) {
+            return formatArrayDisplay((Value[]) val.getValue());
+        }
+        if (val.kind() != Value.Kind.CLASS) return val.toConcatString();
 
         ObjectInstance obj = val.asClassObj();
         if (obj == null) return "null";
@@ -1978,7 +2030,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (dimIndex == dims.length - 1 && dims.length == totalDims) {
             // Leaf array, fill with default values
             for (int i = 0; i < length; i++) {
-                arr[i] = defaultValueForType(getKindFromString(baseType));
+                if (classes.containsKey(baseType)) {
+                    arr[i] = Value.ofNull(); // class type defaults to null
+                } else {
+                    arr[i] = defaultValueForType(getKindFromString(baseType));
+                }
             }
         } else {
             // Recursive multi dimensional array allocation if dims has more
@@ -2849,12 +2905,12 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (argType.equals("null") && (formalParamType.endsWith("[]") || classes.containsKey(formalParamType)))
             return 1;
 
-        // Class upcast: subclass → superclass
+        // Class upcast: subclass → superclass (flat cost = 1 per spec)
         if (arg.kind() == Value.Kind.CLASS && classes.containsKey(formalParamType)) {
             ObjectInstance obj = arg.asClassObj();
             if (obj != null) {
                 int dist = getInheritanceDistance(obj.className, formalParamType);
-                if (dist >= 0) return dist;
+                if (dist >= 0) return 1; // all upcasts cost 1, not depth
             }
         }
 
