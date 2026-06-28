@@ -61,6 +61,11 @@ final class Value {
         return new Value(Kind.CLASS, obj, obj.className, false);
     }
 
+    /** Create a class object value with an explicit declared type (for casts). */
+    static Value ofClassObjWithType(ObjectInstance obj, String declaredType) {
+        return new Value(Kind.CLASS, obj, declaredType, false);
+    }
+
     Kind kind() {
         return kind;
     }

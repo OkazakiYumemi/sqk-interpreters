@@ -963,6 +963,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     }
 
     private Value evalCast(String typeName, Value operand) {
+        // --- Primitive casts ---
         if ("int".equals(typeName)) {
             return Value.ofInt(requireIntegral(operand));
         }
@@ -971,7 +972,48 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             return Value.ofChar(requireIntegral(operand));
         }
 
-        throw new EvalException("Only int/char casts are supported.");
+        // --- Class type casts ---
+        if (classes.containsKey(typeName)) {
+            // (C) null → always null
+            if (operand.kind() == Value.Kind.NULL) {
+                return Value.ofNull();
+            }
+
+            // Operand must be a class type
+            if (operand.kind() != Value.Kind.CLASS) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            ObjectInstance obj = operand.asClassObj();
+            if (obj == null) {
+                return Value.ofNull(); // null is always valid
+            }
+
+            String realType = obj.className;
+
+            // Check that the declared type and target type are in the same inheritance tree
+            String declType = operand.getTypeName();
+            if (!isSameInheritanceTree(declType, typeName)) {
+                // Unrelated types → error
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            // Upcast: (Super) subExpr → always legal
+            // Downcast: (Sub) superExpr → legal only if real(expr) is Sub or subclass of Sub
+            int dist = getInheritanceDistance(realType, typeName);
+            if (dist < 0) {
+                // real type is NOT typeName or its subclass → downcast fails
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            // Cast succeeds — return the object with the target declared type
+            return Value.ofClassObjWithType(obj, typeName);
+        }
+
+        throw new EvalException("Unsupported cast type: " + typeName);
     }
 
     private Value evalArrayAccess(MiniJavaParser.ExpressionContext ctx) {
@@ -1387,6 +1429,24 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             // array == null or null == array: check if array reference is null
             Value arr = left.kind() == Value.Kind.ARRAY ? left : right;
             result = arr.getValue() == null;
+        } else if (left.kind() == Value.Kind.CLASS && right.kind() == Value.Kind.CLASS) {
+            // Class object reference equality
+            // Both must be in the same inheritance tree
+            String leftDeclType = left.getTypeName();
+            String rightDeclType = right.getTypeName();
+            if (!isSameInheritanceTree(leftDeclType, rightDeclType)) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            // Reference equality (same object pointer)
+            ObjectInstance leftObj = left.asClassObj();
+            ObjectInstance rightObj = right.asClassObj();
+            result = (leftObj == rightObj);
+        } else if ((left.kind() == Value.Kind.CLASS && right.kind() == Value.Kind.NULL)
+                || (left.kind() == Value.Kind.NULL && right.kind() == Value.Kind.CLASS)) {
+            // classObj == null or null == classObj: check if class reference is null
+            Value classVal = left.kind() == Value.Kind.CLASS ? left : right;
+            result = classVal.asClassObj() == null;
         } else if (left.kind() == Value.Kind.NULL && right.kind() == Value.Kind.NULL) {
             result = true;
         } else {
@@ -2415,8 +2475,10 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         // ---- Step 2: Implicit super() if no explicit delegation ----
         if (!didExplicitDelegation && ci.parentName != null) {
             ClassInfo superCi = classes.get(ci.parentName);
-            // Call default constructor of superclass
-            executeSuperConstructor(superCi, null, Collections.emptyList());
+            // Find the default constructor of the superclass (may be explicit or implicit)
+            MiniJavaParser.ConstructorDeclarationContext superCtor =
+                findConstructor(superCi, Collections.emptyList());
+            executeSuperConstructor(superCi, superCtor, Collections.emptyList());
         }
 
         // ---- Step 3: Field initializers (only if no this() delegation) ----
