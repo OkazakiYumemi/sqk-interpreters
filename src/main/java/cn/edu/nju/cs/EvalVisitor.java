@@ -580,7 +580,14 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             return Value.ofString(Integer.toString((Integer) arg.getValue()));
         }
 
-        // User defined methods
+        // User defined methods — first try as class method on this (if inside class context)
+        if (currentObject != null && enclosingClass != null) {
+            // Try to resolve as this.method(args...)
+            Value result = tryResolveThisMethod(methodName, args);
+            if (result != null) return result;
+        }
+
+        // Fall back to top-level methods
         List<MiniJavaParser.MethodDeclarationContext> cands = methods.getOrDefault(methodName, Collections.emptyList());
         MiniJavaParser.MethodDeclarationContext best = null;
         int bestCost = Integer.MAX_VALUE;
@@ -969,7 +976,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 ClassInfo declClass = findFieldDeclaringClass(enclosingClass.name, name);
                 if (declClass != null) {
                     FieldInfo fi = declClass.fields.get(name);
-                    Value original = currentObject.fields.get(name);
+                    String fkey = declClass.name + "." + name;
+                    Value original = currentObject.fields.get(fkey);
+                    if (original == null) { original = currentObject.fields.get(name); } // fallback
                     if (original == null) original = defaultValueForTypeName(fi.typeName);
                     if (!original.isIntegral()) {
                         throw new EvalException("++/-- requires int or char.");
@@ -978,7 +987,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                     int updated = original.asIntegral() + delta;
                     Value.Kind targetKind = resolveTypeKind(fi.typeName);
                     Value updatedValue = castIntegralToTarget(targetKind, updated);
-                    currentObject.fields.put(name, updatedValue);
+                    currentObject.fields.put(fkey, updatedValue);
                     return postfix ? original : updatedValue;
                 }
             }
@@ -1191,14 +1200,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 ClassInfo declClass = findFieldDeclaringClass(enclosingClass.name, name);
                 if (declClass != null) {
                     FieldInfo fi = declClass.fields.get(name);
-                    Value currentVal = currentObject.fields.get(name);
+                    String fkey = declClass.name + "." + name;
+                    Value currentVal = currentObject.fields.get(fkey);
+                    if (currentVal == null) { currentVal = currentObject.fields.get(name); } // fallback
                     if (currentVal == null) currentVal = defaultValueForTypeName(fi.typeName);
                     Value.Kind targetKind = resolveTypeKind(fi.typeName);
                     if (ctx.bop.getType() == MiniJavaParser.ASSIGN) {
                         rhs = applyTypeCheckedAssignment(fi.typeName, rhs);
                     }
                     Value assigned = applyAssignment(targetKind, currentVal, ctx.bop.getType(), rhs);
-                    currentObject.fields.put(name, assigned);
+                    currentObject.fields.put(fkey, assigned);
                     return assigned;
                 }
             }
@@ -1275,8 +1286,10 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         FieldInfo fi = declClass.fields.get(fieldName);
         String fieldTypeName = fi.typeName;
 
-        // Get current value
-        Value currentVal = obj.fields.get(fieldName);
+        // Get current value (use qualified key)
+        String fkey = declClass.name + "." + fieldName;
+        Value currentVal = obj.fields.get(fkey);
+        if (currentVal == null) { currentVal = obj.fields.get(fieldName); } // fallback
         if (currentVal == null) currentVal = Value.ofNull();
 
         // Determine target kind for applyAssignment
@@ -1288,7 +1301,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
 
         Value assigned = applyAssignment(targetKind, currentVal, assignOp, rhs);
-        obj.fields.put(fieldName, assigned);
+        obj.fields.put(declClass.name + "." + fieldName, assigned);
         return assigned;
     }
 
@@ -1391,7 +1404,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (targetType == Value.Kind.ARRAY || targetType == Value.Kind.NULL) {
             // For array assignment, rhs must be array of compatible type or null
             if (rhs.kind() == Value.Kind.NULL) {
-                return rhs; // null assignable to any array
+                return rhs; // null assignable to any array, preserves type if typed
             }
             if (rhs.kind() == Value.Kind.ARRAY) {
                 return rhs;
@@ -1523,6 +1536,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             Value classVal = left.kind() == Value.Kind.CLASS ? left : right;
             result = classVal.asClassObj() == null;
         } else if (left.kind() == Value.Kind.NULL && right.kind() == Value.Kind.NULL) {
+            // Both null — check if they carry typed class info in different inheritance trees
+            String leftType = left.getTypeName();
+            String rightType = right.getTypeName();
+            if (!"null".equals(leftType) && !"null".equals(rightType)
+                && classes.containsKey(leftType) && classes.containsKey(rightType)) {
+                if (!isSameInheritanceTree(leftType, rightType)) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+            }
             result = true;
         } else {
             throw new EvalException("Invalid operand types for equality.");
@@ -1779,8 +1802,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     }
 
     private Value defaultValueForTypeName(String typeName) {
-        if (typeName.endsWith("[]")) return Value.ofNull();
-        if (classes.containsKey(typeName)) return Value.ofNull(); // class types default to null
+        if (typeName.endsWith("[]")) return Value.ofNullTyped(typeName);
+        if (classes.containsKey(typeName)) return Value.ofNullTyped(typeName); // class types default to null
         return defaultValueForType(parsePrimitiveType(typeName));
     }
 
@@ -1809,11 +1832,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         // null → any array type
         if (rhsType.equals("null") && typeName.endsWith("[]")) return Value.ofNull();
 
-        // null → any class type
-        if (rhsType.equals("null") && classes.containsKey(typeName)) return Value.ofNull();
+        // null → any class type (preserve declared type)
+        if (rhsType.equals("null") && classes.containsKey(typeName)) return Value.ofNullTyped(typeName);
 
-        // Class type assignment: subclass → superclass (upcast)
+        // Class type assignment: subclass → superclass (upcast) only
+        // Implicit downcast (superclass → subclass) is NOT allowed
         if (rhs.kind() == Value.Kind.CLASS && classes.containsKey(typeName)) {
+            // Check for implicit downcast: declared type of rhs is superclass of target
+            if (classes.containsKey(rhsType) && getInheritanceDistance(typeName, rhsType) > 0) {
+                throw new EvalException("Type mismatch: implicit downcast not allowed.");
+            }
             ObjectInstance obj = rhs.asClassObj();
             if (obj != null && getInheritanceDistance(obj.className, typeName) >= 0) {
                 return Value.ofClassObjWithType(obj, typeName); // upcast: update declared type
@@ -2216,7 +2244,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
     /**
      * Resolve a field on an object, walking the class hierarchy starting from startClass.
-     * Returns the field value.
+     * Uses qualified field keys (ClassName.fieldName) to distinguish same-named fields
+     * in different classes of the inheritance chain (needed for super.x).
      */
     private Value resolveFieldOnObject(ObjectInstance obj, String fieldName, String startClass) {
         String current = startClass;
@@ -2225,7 +2254,10 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             if (ci == null) break;
             FieldInfo fi = ci.fields.get(fieldName);
             if (fi != null) {
-                Value fieldVal = obj.fields.get(fieldName);
+                String key = current + "." + fieldName;
+                Value fieldVal = obj.fields.get(key);
+                // Fallback: try unqualified key (for objects created before this fix)
+                if (fieldVal == null) fieldVal = obj.fields.get(fieldName);
                 return fieldVal != null ? fieldVal : Value.ofNull();
             }
             current = ci.parentName;
@@ -2234,6 +2266,64 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         System.out.println("Process exits with 34.");
         System.exit(34);
         return null;
+    }
+
+    /**
+     * Try to resolve an unqualified method call as this.method(args...).
+     * Returns the result value if a matching method is found, or null if not.
+     */
+    private Value tryResolveThisMethod(String methodName, List<Value> args) {
+        // Collect candidates from the enclosing class and its superclasses
+        List<MiniJavaParser.MethodDeclarationContext> candidates = new ArrayList<>();
+        String search = enclosingClass.name;
+        while (search != null) {
+            ClassInfo ci = classes.get(search);
+            if (ci == null) break;
+            candidates.addAll(ci.getLocalMethods(methodName));
+            search = ci.parentName;
+        }
+
+        // Use the same overload resolution as class method calls
+        MiniJavaParser.MethodDeclarationContext best = resolveBestOverload(candidates, args);
+        if (best == null) return null;
+
+        // Execute using two-phase dispatch (overload on decl(this), override on real(this))
+        return executeClassMethod(best, args, currentObject);
+    }
+
+    /**
+     * Resolve the best overload from a list of candidates given the arguments.
+     * Returns null if no match.
+     */
+    private MiniJavaParser.MethodDeclarationContext resolveBestOverload(
+            List<MiniJavaParser.MethodDeclarationContext> candidates, List<Value> args) {
+        MiniJavaParser.MethodDeclarationContext best = null;
+        int bestCost = Integer.MAX_VALUE;
+        boolean ambiguous = false;
+
+        for (MiniJavaParser.MethodDeclarationContext m : candidates) {
+            List<MiniJavaParser.FormalParameterContext> params =
+                (m.formalParameters().formalParameterList() != null)
+                    ? m.formalParameters().formalParameterList().formalParameter()
+                    : Collections.emptyList();
+            if (params.size() != args.size()) continue;
+
+            int cost = 0;
+            boolean compatible = true;
+            for (int i = 0; i < args.size(); i++) {
+                String paramType = params.get(i).typeType().getText();
+                int c = getArgConversionCost(args.get(i), paramType);
+                if (c == -1) { compatible = false; break; }
+                cost += c;
+            }
+            if (compatible) {
+                if (cost < bestCost) { bestCost = cost; best = m; ambiguous = false; }
+                else if (cost == bestCost) { ambiguous = true; }
+            }
+        }
+
+        if (ambiguous || best == null) return null;
+        return best;
     }
 
     /**
@@ -2847,7 +2937,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 } else {
                     defaultVal = defaultValueForTypeName(fi.typeName);
                 }
-                obj.fields.put(fi.name, defaultVal);
+                obj.fields.put(c.name + "." + fi.name, defaultVal);
             }
         }
 
@@ -2883,7 +2973,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                     initVal = applyTypeCheckedAssignment(fi.typeName, initVal);
                 }
 
-                currentObject.fields.put(fi.name, initVal);
+                currentObject.fields.put(ci.name + "." + fi.name, initVal);
             }
         }
     }
