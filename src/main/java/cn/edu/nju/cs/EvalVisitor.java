@@ -483,14 +483,14 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
         // Built-ins
         if (methodName.equals("print") && args.size() == 1) {
-            System.out.print(args.get(0).displayString());
+            System.out.print(getDisplayString(args.get(0)));
             return null;
         }
         if (methodName.equals("println")) {
             if (args.size() == 0) {
                 System.out.println();
             } else if (args.size() == 1) {
-                System.out.println(args.get(0).displayString());
+                System.out.println(getDisplayString(args.get(0)));
             } else {
                 System.out.println("Process exits with 34.");
                 System.exit(34);
@@ -1567,6 +1567,85 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         return scope;
     }
 
+    /**
+     * Get the display string for a value, handling class objects with to_string() dispatch.
+     * For class objects: if the declared type has a suitable to_string() method,
+     * invoke it via virtual dispatch (real type); otherwise return the class name.
+     */
+    private String getDisplayString(Value val) {
+        if (val.kind() == Value.Kind.NULL) return "null";
+        if (val.kind() != Value.Kind.CLASS) return val.displayString();
+
+        ObjectInstance obj = val.asClassObj();
+        if (obj == null) return "null";
+
+        String declType = val.getTypeName();
+        MiniJavaParser.MethodDeclarationContext toStringMethod = findToStringMethod(declType);
+
+        if (toStringMethod == null) {
+            return obj.className;
+        }
+
+        Value result = invokeToString(obj, toStringMethod);
+        if (result != null && result.kind() == Value.Kind.STRING) {
+            return result.asString();
+        }
+        return obj.className;
+    }
+
+    /**
+     * Find a suitable to_string() method in the class hierarchy starting from startClass.
+     * Suitable means: no parameters, return type string.
+     * Returns the method declaration from the first class that declares it (for overload resolution),
+     * but the actual invocation will use virtual dispatch.
+     */
+    private MiniJavaParser.MethodDeclarationContext findToStringMethod(String startClass) {
+        String current = startClass;
+        while (current != null) {
+            ClassInfo ci = classes.get(current);
+            if (ci == null) break;
+            for (MiniJavaParser.MethodDeclarationContext m : ci.getLocalMethods("to_string")) {
+                // Check: no parameters, return type string
+                boolean noParams = m.formalParameters().formalParameterList() == null
+                    || m.formalParameters().formalParameterList().formalParameter().isEmpty();
+                boolean returnsString = m.typeType() != null && "string".equals(m.typeType().getText());
+                if (noParams && returnsString) {
+                    return m; // found in declared type — will be used for virtual dispatch
+                }
+            }
+            current = ci.parentName;
+        }
+        return null;
+    }
+
+    /**
+     * Invoke to_string() on the given object using virtual dispatch.
+     * Finds the most specific override in the real type hierarchy.
+     */
+    private Value invokeToString(ObjectInstance obj, MiniJavaParser.MethodDeclarationContext baseMethod) {
+        // Find the most specific override in the real type hierarchy
+        String realType = obj.className;
+        MiniJavaParser.MethodDeclarationContext resolved = baseMethod;
+        String search = realType;
+        while (search != null) {
+            ClassInfo ci = classes.get(search);
+            if (ci == null) break;
+            for (MiniJavaParser.MethodDeclarationContext m : ci.getLocalMethods("to_string")) {
+                if (methodSignaturesMatch(m, baseMethod)) {
+                    resolved = m;
+                    search = null; // found most specific
+                    break;
+                }
+            }
+            if (search != null) {
+                search = ci.parentName;
+            }
+        }
+
+        // Execute the resolved method
+        return executeClassMethod(resolved, Collections.emptyList(), obj);
+    }
+
     private VariableBinding resolveVariable(String identifier) {
         for (ScopeFrame scope : scopeStack) {
             VariableBinding variable = scope.variables.get(identifier);
@@ -2176,7 +2255,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                         bestMethod = m;
                         ambiguous = false;
                     } else if (currentCost == bestCost) {
-                        ambiguous = true;
+                        // Same cost: only ambiguous if different signatures
+                        if (!methodSignaturesMatch(bestMethod, m)) {
+                            ambiguous = true;
+                        }
+                        // Same signature → not ambiguous; keep the more specific one (already in bestMethod)
                     }
                 }
             }
