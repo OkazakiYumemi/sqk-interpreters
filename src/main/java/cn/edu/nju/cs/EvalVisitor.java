@@ -481,6 +481,12 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             }
         }
 
+        // Unqualified method call: try class method on this first (before built-ins!)
+        if (currentObject != null && enclosingClass != null) {
+            Value result = tryResolveThisMethod(methodName, args);
+            if (result != null) return (result.kind() == Value.Kind.INT && result.asIntegral() == Integer.MIN_VALUE) ? null : result;
+        }
+
         // Built-ins
         if (methodName.equals("print") && args.size() == 1) {
             System.out.print(getDisplayString(args.get(0)));
@@ -578,13 +584,6 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 System.exit(34);
             }
             return Value.ofString(Integer.toString((Integer) arg.getValue()));
-        }
-
-        // User defined methods — first try as class method on this (if inside class context)
-        if (currentObject != null && enclosingClass != null) {
-            // Try to resolve as this.method(args...)
-            Value result = tryResolveThisMethod(methodName, args);
-            if (result != null) return result;
         }
 
         // Fall back to top-level methods
@@ -2236,7 +2235,24 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             startClass = enclosingClass != null ? enclosingClass.name : obj.className;
         } else {
             // v.x: start from the declared type of v
-            startClass = objVal.getTypeName(); // declared type from variable
+            // For array elements like arr[i].x, the declared type is the array's element type
+            if (leftExpr.LBRACK() != null && leftExpr.expression().size() == 2) {
+                // arr[idx] — get array's type to determine declared element type
+                Value arr = visit(leftExpr.expression(0));
+                String arrType = arr.getTypeName();
+                if (arrType.endsWith("[]")) {
+                    String elemType = arrType.substring(0, arrType.length() - 2);
+                    if (classes.containsKey(elemType)) {
+                        startClass = elemType;
+                    } else {
+                        startClass = objVal.getTypeName();
+                    }
+                } else {
+                    startClass = objVal.getTypeName();
+                }
+            } else {
+                startClass = objVal.getTypeName(); // declared type from variable
+            }
         }
 
         return resolveFieldOnObject(obj, fieldName, startClass);
@@ -2271,59 +2287,68 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     /**
      * Try to resolve an unqualified method call as this.method(args...).
      * Returns the result value if a matching method is found, or null if not.
+     * Uses two-phase dispatch: Phase 1 on decl(this), Phase 2 on real(this).
      */
     private Value tryResolveThisMethod(String methodName, List<Value> args) {
-        // Collect candidates from the enclosing class and its superclasses
-        List<MiniJavaParser.MethodDeclarationContext> candidates = new ArrayList<>();
+        if (currentObject == null || enclosingClass == null) return null;
+
+        // Phase 1: Overload resolution on declaring class and its ancestors
+        MiniJavaParser.MethodDeclarationContext bestMethod = null;
+        int bestCost = Integer.MAX_VALUE;
+        boolean ambiguous = false;
+
         String search = enclosingClass.name;
         while (search != null) {
             ClassInfo ci = classes.get(search);
             if (ci == null) break;
-            candidates.addAll(ci.getLocalMethods(methodName));
+            for (MiniJavaParser.MethodDeclarationContext m : ci.getLocalMethods(methodName)) {
+                List<MiniJavaParser.FormalParameterContext> params =
+                    (m.formalParameters().formalParameterList() != null)
+                        ? m.formalParameters().formalParameterList().formalParameter()
+                        : Collections.emptyList();
+                if (params.size() != args.size()) continue;
+                int cost = 0;
+                boolean compatible = true;
+                for (int i = 0; i < args.size(); i++) {
+                    String paramType = params.get(i).typeType().getText();
+                    int c = getArgConversionCost(args.get(i), paramType);
+                    if (c == -1) { compatible = false; break; }
+                    cost += c;
+                }
+                if (compatible) {
+                    if (cost < bestCost) { bestCost = cost; bestMethod = m; ambiguous = false; }
+                    else if (cost == bestCost) {
+                        if (!methodSignaturesMatch(bestMethod, m)) ambiguous = true;
+                        // Same signature: prefer more specific (subclass) method
+                    }
+                }
+            }
             search = ci.parentName;
         }
 
-        // Use the same overload resolution as class method calls
-        MiniJavaParser.MethodDeclarationContext best = resolveBestOverload(candidates, args);
-        if (best == null) return null;
+        if (bestMethod == null || ambiguous) return null;
 
-        // Execute using two-phase dispatch (overload on decl(this), override on real(this))
-        return executeClassMethod(best, args, currentObject);
-    }
-
-    /**
-     * Resolve the best overload from a list of candidates given the arguments.
-     * Returns null if no match.
-     */
-    private MiniJavaParser.MethodDeclarationContext resolveBestOverload(
-            List<MiniJavaParser.MethodDeclarationContext> candidates, List<Value> args) {
-        MiniJavaParser.MethodDeclarationContext best = null;
-        int bestCost = Integer.MAX_VALUE;
-        boolean ambiguous = false;
-
-        for (MiniJavaParser.MethodDeclarationContext m : candidates) {
-            List<MiniJavaParser.FormalParameterContext> params =
-                (m.formalParameters().formalParameterList() != null)
-                    ? m.formalParameters().formalParameterList().formalParameter()
-                    : Collections.emptyList();
-            if (params.size() != args.size()) continue;
-
-            int cost = 0;
-            boolean compatible = true;
-            for (int i = 0; i < args.size(); i++) {
-                String paramType = params.get(i).typeType().getText();
-                int c = getArgConversionCost(args.get(i), paramType);
-                if (c == -1) { compatible = false; break; }
-                cost += c;
+        // Phase 2: Override resolution on real(this) type
+        String realType = currentObject.className;
+        MiniJavaParser.MethodDeclarationContext resolved = bestMethod;
+        String overrideSearch = realType;
+        while (overrideSearch != null) {
+            ClassInfo ci = classes.get(overrideSearch);
+            if (ci == null) break;
+            for (MiniJavaParser.MethodDeclarationContext m : ci.getLocalMethods(methodName)) {
+                if (methodSignaturesMatch(m, bestMethod)) {
+                    resolved = m;
+                    overrideSearch = null;
+                    break;
+                }
             }
-            if (compatible) {
-                if (cost < bestCost) { bestCost = cost; best = m; ambiguous = false; }
-                else if (cost == bestCost) { ambiguous = true; }
-            }
+            if (overrideSearch != null) overrideSearch = ci.parentName;
         }
 
-        if (ambiguous || best == null) return null;
-        return best;
+        Value ret = executeClassMethod(resolved, args, currentObject);
+        // For void methods, executeClassMethod returns null.
+        // Return a sentinel to indicate the method was found and executed (vs. not found).
+        return (ret != null) ? ret : Value.ofInt(Integer.MIN_VALUE); // sentinel for void
     }
 
     /**
@@ -2379,7 +2404,22 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 startClass = enclosingClass != null ? enclosingClass.name : currentObject.className;
             }
         } else {
-            receiverVal = visit(leftExpr);
+            // For array elements like arr[i].method(), resolve the array first to get element type
+            boolean isArrayAccess = leftExpr.LBRACK() != null && leftExpr.expression().size() == 2;
+            String arrayElemType = null;
+            if (isArrayAccess) {
+                Value arr = visit(leftExpr.expression(0));
+                String arrType = arr.getTypeName();
+                if (arrType.endsWith("[]")) {
+                    String elemType = arrType.substring(0, arrType.length() - 2);
+                    if (classes.containsKey(elemType)) arrayElemType = elemType;
+                }
+            }
+            receiverVal = visit(isArrayAccess ? leftExpr : leftExpr);
+            // Actually for array access, visit(leftExpr) gives the element, which is the receiver
+            if (isArrayAccess) {
+                receiverVal = visit(leftExpr); // this visits arr[idx] → returns the element
+            }
             if (receiverVal.kind() == Value.Kind.NULL) {
                 System.out.println("Process exits with 34.");
                 System.exit(34);
@@ -2388,7 +2428,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 System.out.println("Process exits with 34.");
                 System.exit(34);
             }
-            startClass = receiverVal.getTypeName(); // declared type
+            if (arrayElemType != null) {
+                startClass = arrayElemType;
+            } else {
+                startClass = receiverVal.getTypeName(); // declared type
+            }
         }
 
         ObjectInstance receiver = receiverVal.asClassObj();
@@ -2448,10 +2492,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             System.exit(34);
         }
 
-        // Phase 2: Override resolution on real type
-        String realClassName = receiver.className;
+        // Phase 2: Override resolution on real type (or startClass for super)
+        String overrideSearch = isSuper ? startClass : receiver.className;
         MiniJavaParser.MethodDeclarationContext resolvedMethod = bestMethod;
-        String overrideSearch = realClassName;
         while (overrideSearch != null) {
             ClassInfo ci = classes.get(overrideSearch);
             if (ci == null) break;
