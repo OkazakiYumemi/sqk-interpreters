@@ -724,8 +724,40 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             return visit(ctx.literal());
         }
 
+        // Handle THIS keyword: return current object reference
+        if (ctx.THIS() != null) {
+            if (currentObject == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            return Value.ofClassObj(currentObject);
+        }
+
+        // Handle SUPER keyword (as primary); actual resolution happens in DOT handler.
+        // SUPER alone (without .x or .(...)) is an error, but we return currentObject
+        // so the DOT/methodCall handler can detect it.
+        if (ctx.SUPER() != null) {
+            if (currentObject == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            return Value.ofClassObj(currentObject);
+        }
+
         if (ctx.identifier() != null) {
-            return resolveVariable(ctx.identifier().getText()).value;
+            String name = ctx.identifier().getText();
+            // First try local scope resolution
+            for (ScopeFrame scope : scopeStack) {
+                VariableBinding variable = scope.variables.get(name);
+                if (variable != null) {
+                    return variable.value;
+                }
+            }
+            // Not found in local scope: if inside a class method, try this.x
+            if (currentObject != null) {
+                return resolveFieldOnObject(currentObject, name, enclosingClass.name);
+            }
+            throw new EvalException("Undeclared variable: " + name);
         }
 
         return visit(ctx.expression());
@@ -771,10 +803,19 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
     @Override
     public Value visitExpression(MiniJavaParser.ExpressionContext ctx) {
+        // NOTE: Order matters! DOT expressions (a.foo, a.foo()) contain
+        // methodCall/identifier children, so check bop/DOT BEFORE standalone methodCall/primary.
+
+        // ---- DOT operator: field access or method call (must be before primary/methodCall) ----
+        if (ctx.bop != null && ctx.bop.getType() == MiniJavaParser.DOT) {
+            return evalDotExpression(ctx);
+        }
+
         if (ctx.primary() != null) {
             return visit(ctx.primary());
         }
 
+        // Standalone methodCall (not part of a DOT expression)
         if (ctx.methodCall() != null) {
             return visit(ctx.methodCall());
         }
@@ -867,6 +908,44 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 ? Value.ofChar(updated) : Value.ofInt(updated);
             return postfix ? (elem.kind() == Value.Kind.CHAR ? Value.ofChar(original) : Value.ofInt(original))
                            : (elem.kind() == Value.Kind.CHAR ? Value.ofChar(updated) : Value.ofInt(updated));
+        }
+
+        // Check if target is a simple identifier that might be a field on this
+        if (target.primary() != null && target.primary().identifier() != null) {
+            String name = target.primary().identifier().getText();
+            // Try local variable first
+            for (ScopeFrame scope : scopeStack) {
+                VariableBinding variable = scope.variables.get(name);
+                if (variable != null) {
+                    if (!isIntegralType(variable.declaredType)) {
+                        throw new EvalException("++/-- requires int or char.");
+                    }
+                    Value original = variable.value;
+                    int delta = increment ? 1 : -1;
+                    int updated = original.asIntegral() + delta;
+                    Value updatedValue = castIntegralToTarget(variable.declaredType, updated);
+                    variable.value = updatedValue;
+                    return postfix ? original : updatedValue;
+                }
+            }
+            // Not a local variable — try field on this
+            if (currentObject != null && enclosingClass != null) {
+                ClassInfo declClass = findFieldDeclaringClass(enclosingClass.name, name);
+                if (declClass != null) {
+                    FieldInfo fi = declClass.fields.get(name);
+                    Value original = currentObject.fields.get(name);
+                    if (original == null) original = defaultValueForTypeName(fi.typeName);
+                    if (!original.isIntegral()) {
+                        throw new EvalException("++/-- requires int or char.");
+                    }
+                    int delta = increment ? 1 : -1;
+                    int updated = original.asIntegral() + delta;
+                    Value.Kind targetKind = resolveTypeKind(fi.typeName);
+                    Value updatedValue = castIntegralToTarget(targetKind, updated);
+                    currentObject.fields.put(name, updatedValue);
+                    return postfix ? original : updatedValue;
+                }
+            }
         }
 
         // Simple variable inc/dec
@@ -974,6 +1053,40 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             return assigned;
         }
 
+        // Field assignment: obj.field = rhs or this.field = rhs
+        if (left.bop != null && left.bop.getType() == MiniJavaParser.DOT && left.identifier() != null) {
+            return evalFieldAssignment(left, ctx.bop.getType(), rhs);
+        }
+
+        // Check if left side is a simple identifier that is a field on this
+        if (left.primary() != null && left.primary().identifier() != null) {
+            String name = left.primary().identifier().getText();
+            // Try local variable first
+            VariableBinding variable = null;
+            for (ScopeFrame scope : scopeStack) {
+                variable = scope.variables.get(name);
+                if (variable != null) break;
+            }
+            if (variable != null) {
+                // It's a local variable — use normal variable assignment below
+            } else if (currentObject != null && enclosingClass != null) {
+                // Try as field on this
+                ClassInfo declClass = findFieldDeclaringClass(enclosingClass.name, name);
+                if (declClass != null) {
+                    FieldInfo fi = declClass.fields.get(name);
+                    Value currentVal = currentObject.fields.get(name);
+                    if (currentVal == null) currentVal = defaultValueForTypeName(fi.typeName);
+                    Value.Kind targetKind = resolveTypeKind(fi.typeName);
+                    if (ctx.bop.getType() == MiniJavaParser.ASSIGN) {
+                        rhs = applyTypeCheckedAssignment(fi.typeName, rhs);
+                    }
+                    Value assigned = applyAssignment(targetKind, currentVal, ctx.bop.getType(), rhs);
+                    currentObject.fields.put(name, assigned);
+                    return assigned;
+                }
+            }
+        }
+
         // Simple variable assignment
         VariableBinding variable = resolveVariable(extractAssignableName(left));
         if (rhs.kind() == Value.Kind.ARRAY && variable.typeName.endsWith("[]")) {
@@ -984,6 +1097,81 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
         Value assigned = applyAssignment(variable.declaredType, variable.value, ctx.bop.getType(), rhs);
         variable.value = assigned;
+        return assigned;
+    }
+
+    /**
+     * Evaluate field assignment: obj.field op= rhs or this.field op= rhs.
+     */
+    private Value evalFieldAssignment(MiniJavaParser.ExpressionContext left, int assignOp, Value rhs) {
+        String fieldName = left.identifier().getText();
+        MiniJavaParser.ExpressionContext targetExpr = left.expression(0);
+
+        boolean isThis = targetExpr.primary() != null && targetExpr.primary().THIS() != null;
+        boolean isSuper = targetExpr.primary() != null && targetExpr.primary().SUPER() != null;
+
+        Value objVal;
+        String startClass;
+
+        if (isThis || isSuper) {
+            if (currentObject == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            objVal = Value.ofClassObj(currentObject);
+            if (isSuper) {
+                if (enclosingClass == null || enclosingClass.parentName == null) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+                startClass = enclosingClass.parentName;
+            } else {
+                startClass = enclosingClass != null ? enclosingClass.name : currentObject.className;
+            }
+        } else {
+            objVal = visit(targetExpr);
+            startClass = objVal.getTypeName();
+        }
+
+        // Null pointer check
+        if (objVal.kind() == Value.Kind.NULL) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+        if (objVal.kind() != Value.Kind.CLASS) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        ObjectInstance obj = objVal.asClassObj();
+        if (obj == null) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        // Find the declaring class to get the field type
+        ClassInfo declClass = findFieldDeclaringClass(startClass, fieldName);
+        if (declClass == null) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+        FieldInfo fi = declClass.fields.get(fieldName);
+        String fieldTypeName = fi.typeName;
+
+        // Get current value
+        Value currentVal = obj.fields.get(fieldName);
+        if (currentVal == null) currentVal = Value.ofNull();
+
+        // Determine target kind for applyAssignment
+        Value.Kind targetKind = resolveTypeKind(fieldTypeName);
+
+        // Apply type checking to rhs
+        if (assignOp == MiniJavaParser.ASSIGN) {
+            rhs = applyTypeCheckedAssignment(fieldTypeName, rhs);
+        }
+
+        Value assigned = applyAssignment(targetKind, currentVal, assignOp, rhs);
+        obj.fields.put(fieldName, assigned);
         return assigned;
     }
 
@@ -1679,10 +1867,385 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         return classes.get(typeName);
     }
 
+    // ========== Task 4: Field Access ==========
+
+    /**
+     * Evaluate a DOT expression: either field access (obj.field) or method call (obj.method()).
+     * Handles this.x, super.x, v.x, and this.method(), super.method(), v.method().
+     */
+    private Value evalDotExpression(MiniJavaParser.ExpressionContext ctx) {
+        MiniJavaParser.ExpressionContext leftExpr = ctx.expression(0);
+
+        // Check if this is a field access (identifier) or method call (methodCall) on the right
+        boolean isFieldAccess = ctx.identifier() != null;
+        boolean isMethodCall = ctx.methodCall() != null;
+
+        // Detect this/super on the left side
+        boolean isThis = leftExpr.primary() != null && leftExpr.primary().THIS() != null;
+        boolean isSuper = leftExpr.primary() != null && leftExpr.primary().SUPER() != null;
+
+        if (isFieldAccess) {
+            String fieldName = ctx.identifier().getText();
+            return evalFieldAccess(leftExpr, fieldName, isThis, isSuper);
+        }
+
+        if (isMethodCall) {
+            return evalMethodCallOnObject(leftExpr, ctx.methodCall(), isThis, isSuper);
+        }
+
+        throw new EvalException("Invalid DOT expression.");
+    }
+
+    /**
+     * Evaluate field access: obj.field, this.field, or super.field.
+     */
+    private Value evalFieldAccess(MiniJavaParser.ExpressionContext leftExpr, String fieldName,
+                                   boolean isThis, boolean isSuper) {
+        Value objVal;
+
+        if (isThis || isSuper) {
+            // this.x or super.x → use currentObject directly
+            if (currentObject == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            objVal = Value.ofClassObj(currentObject);
+        } else {
+            objVal = visit(leftExpr);
+        }
+
+        // Null pointer check
+        if (objVal.kind() == Value.Kind.NULL) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+        if (objVal.kind() != Value.Kind.CLASS) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        ObjectInstance obj = objVal.asClassObj();
+        if (obj == null) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        // Determine the starting class for field lookup
+        String startClass;
+        if (isSuper) {
+            // super.x: start from the direct superclass of the enclosing class
+            if (enclosingClass == null || enclosingClass.parentName == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            startClass = enclosingClass.parentName;
+        } else if (isThis) {
+            // this.x: start from the enclosing class (decl(this))
+            startClass = enclosingClass != null ? enclosingClass.name : obj.className;
+        } else {
+            // v.x: start from the declared type of v
+            startClass = objVal.getTypeName(); // declared type from variable
+        }
+
+        return resolveFieldOnObject(obj, fieldName, startClass);
+    }
+
+    /**
+     * Resolve a field on an object, walking the class hierarchy starting from startClass.
+     * Returns the field value.
+     */
+    private Value resolveFieldOnObject(ObjectInstance obj, String fieldName, String startClass) {
+        String current = startClass;
+        while (current != null) {
+            ClassInfo ci = classes.get(current);
+            if (ci == null) break;
+            FieldInfo fi = ci.fields.get(fieldName);
+            if (fi != null) {
+                Value fieldVal = obj.fields.get(fieldName);
+                return fieldVal != null ? fieldVal : Value.ofNull();
+            }
+            current = ci.parentName;
+        }
+        // Field not found
+        System.out.println("Process exits with 34.");
+        System.exit(34);
+        return null;
+    }
+
+    /**
+     * Find which class declares a field, walking up from startClass.
+     * Returns the ClassInfo where the field is declared, or null.
+     */
+    private ClassInfo findFieldDeclaringClass(String startClass, String fieldName) {
+        String current = startClass;
+        while (current != null) {
+            ClassInfo ci = classes.get(current);
+            if (ci == null) break;
+            if (ci.fields.containsKey(fieldName)) return ci;
+            current = ci.parentName;
+        }
+        return null;
+    }
+
+    /**
+     * Evaluate a method call on an object: obj.method(args), this.method(args), super.method(args).
+     * Uses two-phase dispatch (overload resolution + override resolution).
+     * Full implementation in Task 5; basic implementation here.
+     */
+    private Value evalMethodCallOnObject(MiniJavaParser.ExpressionContext leftExpr,
+                                          MiniJavaParser.MethodCallContext callCtx,
+                                          boolean isThis, boolean isSuper) {
+        String methodName = callCtx.identifier().getText();
+
+        // Evaluate arguments
+        List<Value> args = new ArrayList<>();
+        if (callCtx.arguments().expressionList() != null) {
+            for (MiniJavaParser.ExpressionContext argCtx : callCtx.arguments().expressionList().expression()) {
+                args.add(visit(argCtx));
+            }
+        }
+
+        // Determine receiver object and declared type
+        Value receiverVal;
+        String startClass; // for overload resolution (declared type)
+
+        if (isThis || isSuper) {
+            if (currentObject == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            receiverVal = Value.ofClassObj(currentObject);
+            if (isSuper) {
+                if (enclosingClass == null || enclosingClass.parentName == null) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+                startClass = enclosingClass.parentName;
+            } else {
+                startClass = enclosingClass != null ? enclosingClass.name : currentObject.className;
+            }
+        } else {
+            receiverVal = visit(leftExpr);
+            if (receiverVal.kind() == Value.Kind.NULL) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            if (receiverVal.kind() != Value.Kind.CLASS) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            startClass = receiverVal.getTypeName(); // declared type
+        }
+
+        ObjectInstance receiver = receiverVal.asClassObj();
+        if (receiver == null) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        // Phase 1: Overload resolution on declared type hierarchy
+        MiniJavaParser.MethodDeclarationContext bestMethod = null;
+        int bestCost = Integer.MAX_VALUE;
+        boolean ambiguous = false;
+
+        String searchClass = startClass;
+        while (searchClass != null) {
+            ClassInfo ci = classes.get(searchClass);
+            if (ci == null) break;
+            for (MiniJavaParser.MethodDeclarationContext m : ci.getLocalMethods(methodName)) {
+                List<MiniJavaParser.FormalParameterContext> params =
+                    (m.formalParameters().formalParameterList() != null)
+                        ? m.formalParameters().formalParameterList().formalParameter()
+                        : Collections.emptyList();
+                if (params.size() != args.size()) continue;
+
+                int currentCost = 0;
+                boolean compatible = true;
+                for (int i = 0; i < args.size(); i++) {
+                    String paramType = params.get(i).typeType().getText();
+                    int cost = getArgConversionCost(args.get(i), paramType);
+                    if (cost == -1) { compatible = false; break; }
+                    currentCost += cost;
+                }
+                if (compatible) {
+                    if (currentCost < bestCost) {
+                        bestCost = currentCost;
+                        bestMethod = m;
+                        ambiguous = false;
+                    } else if (currentCost == bestCost) {
+                        ambiguous = true;
+                    }
+                }
+            }
+            searchClass = ci.parentName;
+        }
+
+        if (bestMethod == null || ambiguous) {
+            // If not found in class hierarchy and not this/super, try top-level methods
+            if (!isThis && !isSuper) {
+                // Fall back to top-level method call
+                return visitMethodCall(callCtx);
+            }
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        // Phase 2: Override resolution on real type
+        String realClassName = receiver.className;
+        MiniJavaParser.MethodDeclarationContext resolvedMethod = bestMethod;
+        String overrideSearch = realClassName;
+        while (overrideSearch != null) {
+            ClassInfo ci = classes.get(overrideSearch);
+            if (ci == null) break;
+            for (MiniJavaParser.MethodDeclarationContext m : ci.getLocalMethods(methodName)) {
+                if (methodSignaturesMatch(m, bestMethod)) {
+                    resolvedMethod = m;
+                    // Found the most specific override; break out of both loops
+                    overrideSearch = null;
+                    break;
+                }
+            }
+            if (overrideSearch != null) {
+                overrideSearch = ci.parentName;
+            }
+        }
+
+        return executeClassMethod(resolvedMethod, args, receiver);
+    }
+
+    /** Check if two method declarations have the same signature (name + parameter types). */
+    private boolean methodSignaturesMatch(MiniJavaParser.MethodDeclarationContext a,
+                                           MiniJavaParser.MethodDeclarationContext b) {
+        List<MiniJavaParser.FormalParameterContext> paramsA =
+            (a.formalParameters().formalParameterList() != null)
+                ? a.formalParameters().formalParameterList().formalParameter()
+                : Collections.emptyList();
+        List<MiniJavaParser.FormalParameterContext> paramsB =
+            (b.formalParameters().formalParameterList() != null)
+                ? b.formalParameters().formalParameterList().formalParameter()
+                : Collections.emptyList();
+        if (paramsA.size() != paramsB.size()) return false;
+        for (int i = 0; i < paramsA.size(); i++) {
+            if (!paramsA.get(i).typeType().getText().equals(paramsB.get(i).typeType().getText()))
+                return false;
+        }
+        return true;
+    }
+
+    /**
+     * Execute a class method with the given receiver object.
+     * Sets up currentObject and enclosingClass for the duration of the call.
+     */
+    private Value executeClassMethod(MiniJavaParser.MethodDeclarationContext m,
+                                      List<Value> args, ObjectInstance receiver) {
+        ObjectInstance savedObj = this.currentObject;
+        ClassInfo savedEnclosing = this.enclosingClass;
+        this.currentObject = receiver;
+
+        // Determine which class owns this method
+        String methodClassName = getMethodOwnerClassName(m);
+        this.enclosingClass = classes.get(methodClassName);
+
+        Deque<ScopeFrame> savedStack = new ArrayDeque<>(scopeStack);
+        scopeStack.clear();
+        enterScope();
+
+        try {
+            // Bind parameters
+            List<MiniJavaParser.FormalParameterContext> params =
+                (m.formalParameters().formalParameterList() != null)
+                    ? m.formalParameters().formalParameterList().formalParameter()
+                    : Collections.emptyList();
+            for (int i = 0; i < params.size(); i++) {
+                String pName = params.get(i).identifier().getText();
+                String pTypeStr = params.get(i).typeType().getText();
+                Value argVal = args.get(i);
+                argVal = applyArgConversion(argVal, pTypeStr);
+                currentScope().variables.put(pName,
+                    new VariableBinding(argVal.kind(), pTypeStr, argVal));
+            }
+
+            Value ret = null;
+            try {
+                visit(m.block());
+            } catch (ReturnSignal sig) {
+                ret = sig.getValue();
+            } catch (EvalException ex) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            boolean isVoid = m.VOID() != null;
+            if (isVoid) {
+                if (ret != null) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+                return null;
+            } else {
+                if (ret == null) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+                String retType = m.typeType().getText();
+                int cost = getReturnConversionCost(ret, retType);
+                if (cost == -1) {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+                if (cost == 1) {
+                    if (retType.equals("int") && ret.getTypeName().equals("char")) {
+                        ret = Value.ofInt(ret.asIntegral());
+                    } else if (retType.equals("char") && ret.getTypeName().equals("int")) {
+                        ret = Value.ofChar(ret.asIntegral());
+                    } else if (retType.endsWith("[]") && ret.getTypeName().equals("null")) {
+                        ret = Value.ofNullTyped(retType);
+                    }
+                }
+                if (ret.isDecimalLiteral()) {
+                    ret = Value.ofInt(ret.asIntegral());
+                }
+                return ret;
+            }
+        } finally {
+            scopeStack.clear();
+            scopeStack.addAll(savedStack);
+            this.currentObject = savedObj;
+            this.enclosingClass = savedEnclosing;
+        }
+    }
+
+    /**
+     * Find which class owns a given method declaration.
+     * We search all classes to find the one containing this method.
+     */
+    private String getMethodOwnerClassName(MiniJavaParser.MethodDeclarationContext m) {
+        for (ClassInfo ci : classes.values()) {
+            for (List<MiniJavaParser.MethodDeclarationContext> overloads : ci.methods.values()) {
+                if (overloads.contains(m)) return ci.name;
+            }
+        }
+        // If not found by reference, try matching by method name + signature
+        if (m != null && m.identifier() != null) {
+            String mName = m.identifier().getText();
+            for (ClassInfo ci : classes.values()) {
+                if (ci.methods.containsKey(mName)) {
+                    for (MiniJavaParser.MethodDeclarationContext candidate : ci.methods.get(mName)) {
+                        if (methodSignaturesMatch(candidate, m)) return ci.name;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     // ========== Task 3: Object Creation & Constructors ==========
 
-    /** The object currently being constructed (used during field init and constructor body). */
+    /** The object currently being constructed/accessed (used during field init and constructor body). */
     private ObjectInstance currentObject = null;
+
+    /** The class that owns the currently executing method/constructor (for super resolution). */
+    private ClassInfo enclosingClass = null;
 
     /**
      * Find the best matching constructor for the given arguments using overload resolution.
@@ -1800,6 +2363,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
      * 4. Execute remaining constructor body statements
      */
     private void executeConstructorBody(ClassInfo ci, MiniJavaParser.ConstructorDeclarationContext ctor) {
+        ClassInfo savedEnclosing = this.enclosingClass;
+        this.enclosingClass = ci;
+
         MiniJavaParser.BlockContext block = (ctor != null) ? ctor.block() : null;
         List<MiniJavaParser.BlockStatementContext> statements = (block != null)
             ? block.blockStatement() : Collections.emptyList();
@@ -1864,6 +2430,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 visit(statements.get(i));
             }
         }
+
+        this.enclosingClass = savedEnclosing;
     }
 
     /**
