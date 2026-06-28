@@ -631,6 +631,13 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (argType.equals(formalParamType)) return 0;
         if (argType.equals("char") && formalParamType.equals("int")) return 1;
         if (argType.equals("null") && formalParamType.endsWith("[]")) return 1;
+        if (argType.equals("null") && classes.containsKey(formalParamType)) return 1;
+        // Class upcast: subclass → superclass
+        if (arg.kind() == Value.Kind.CLASS && classes.containsKey(argType)
+            && classes.containsKey(formalParamType)) {
+            int dist = getInheritanceDistance(argType, formalParamType);
+            if (dist >= 0) return dist;
+        }
         return -1;
     }
 
@@ -640,7 +647,14 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (retTypeName.equals(returnType)) return 0;
         if (retTypeName.equals("char") && returnType.equals("int")) return 1;
         if (retTypeName.equals("null") && returnType.endsWith("[]")) return 1;
+        if (retTypeName.equals("null") && classes.containsKey(returnType)) return 1;
         if (retTypeName.equals("int") && returnType.equals("char") && ret.isDecimalLiteral()) return 1;
+        // Class upcast: subclass → superclass (for return type)
+        if (ret.kind() == Value.Kind.CLASS && classes.containsKey(retTypeName)
+            && classes.containsKey(returnType)) {
+            int dist = getInheritanceDistance(retTypeName, returnType);
+            if (dist >= 0) return dist;
+        }
         return -1;
     }
 
@@ -668,7 +682,8 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             if (argVal.isDecimalLiteral()) {
                 argVal = Value.ofInt(argVal.asIntegral());
             }
-            currentScope().variables.put(pName, new VariableBinding(argVal.kind(), pTypeStr, argVal));
+            Value.Kind declaredKind = resolveTypeKind(pTypeStr);
+            currentScope().variables.put(pName, new VariableBinding(declaredKind, pTypeStr, argVal));
         }
 
         Value ret = null;
@@ -692,11 +707,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             }
             return null;
         } else {
-            if (ret == null) {
-                System.out.println("Process exits with 34.");
-                System.exit(34);
-            }
             String retType = m.typeType().getText();
+            // null return is valid for class types and array types
+            if (ret == null) {
+                if (retType.endsWith("[]") || classes.containsKey(retType)) {
+                    ret = Value.ofNullTyped(retType);
+                } else {
+                    System.out.println("Process exits with 34.");
+                    System.exit(34);
+                }
+            }
             int cost = getReturnConversionCost(ret, retType);
             if (cost == -1) {
                 System.out.println("Process exits with 34.");
@@ -709,6 +729,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                     ret = Value.ofChar(ret.asIntegral());
                 } else if (retType.endsWith("[]") && ret.getTypeName().equals("null")) {
                     ret = Value.ofNullTyped(retType); 
+                } else if (classes.containsKey(retType) && ret.getTypeName().equals("null")) {
+                    ret = Value.ofNullTyped(retType);
+                } else if (classes.containsKey(retType) && ret.kind() == Value.Kind.CLASS) {
+                    // Subclass → superclass return: re-wrap with correct declared type
+                    ret = Value.ofClassObjWithType(ret.asClassObj(), retType);
                 }
             }
             // Strip isDecimalLiteral: return values lose their literal status
@@ -2348,8 +2373,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 String pTypeStr = params.get(i).typeType().getText();
                 Value argVal = args.get(i);
                 argVal = applyArgConversion(argVal, pTypeStr);
+                Value.Kind declaredKind = resolveTypeKind(pTypeStr);
                 currentScope().variables.put(pName,
-                    new VariableBinding(argVal.kind(), pTypeStr, argVal));
+                    new VariableBinding(declaredKind, pTypeStr, argVal));
             }
 
             Value ret = null;
@@ -2370,11 +2396,16 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 }
                 return null;
             } else {
-                if (ret == null) {
-                    System.out.println("Process exits with 34.");
-                    System.exit(34);
-                }
                 String retType = m.typeType().getText();
+                // null return is valid for class types and array types
+                if (ret == null) {
+                    if (retType.endsWith("[]") || classes.containsKey(retType)) {
+                        ret = Value.ofNullTyped(retType);
+                    } else {
+                        System.out.println("Process exits with 34.");
+                        System.exit(34);
+                    }
+                }
                 int cost = getReturnConversionCost(ret, retType);
                 if (cost == -1) {
                     System.out.println("Process exits with 34.");
@@ -2387,6 +2418,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                         ret = Value.ofChar(ret.asIntegral());
                     } else if (retType.endsWith("[]") && ret.getTypeName().equals("null")) {
                         ret = Value.ofNullTyped(retType);
+                    } else if (classes.containsKey(retType) && ret.getTypeName().equals("null")) {
+                        ret = Value.ofNullTyped(retType);
+                    } else if (classes.containsKey(retType) && ret.kind() == Value.Kind.CLASS) {
+                        // Subclass → superclass return: re-wrap with correct declared type
+                        ret = Value.ofClassObjWithType(ret.asClassObj(), retType);
                     }
                 }
                 if (ret.isDecimalLiteral()) {
@@ -2522,8 +2558,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                     String pTypeStr = params.get(i).typeType().getText();
                     Value argVal = args.get(i);
                     argVal = applyArgConversion(argVal, pTypeStr);
+                    Value.Kind declaredKind = resolveTypeKind(pTypeStr);
                     currentScope().variables.put(pName,
-                        new VariableBinding(argVal.kind(), pTypeStr, argVal));
+                        new VariableBinding(declaredKind, pTypeStr, argVal));
                 }
             }
 
@@ -2648,8 +2685,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                 String pTypeStr = params.get(i).typeType().getText();
                 Value argVal = args.get(i);
                 argVal = applyArgConversion(argVal, pTypeStr);
+                Value.Kind declaredKind = resolveTypeKind(pTypeStr);
                 currentScope().variables.put(pName,
-                    new VariableBinding(argVal.kind(), pTypeStr, argVal));
+                    new VariableBinding(declaredKind, pTypeStr, argVal));
             }
 
             // Recurse: executeConstructorBody with the delegated constructor
@@ -2691,8 +2729,9 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
                     String pTypeStr = params.get(i).typeType().getText();
                     Value argVal = args.get(i);
                     argVal = applyArgConversion(argVal, pTypeStr);
+                    Value.Kind declaredKind = resolveTypeKind(pTypeStr);
                     currentScope().variables.put(pName,
-                        new VariableBinding(argVal.kind(), pTypeStr, argVal));
+                        new VariableBinding(declaredKind, pTypeStr, argVal));
                 }
             }
 
