@@ -811,6 +811,11 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             return evalDotExpression(ctx);
         }
 
+        // ---- instanceof operator (must be before primary) ----
+        if (ctx.INSTANCEOF() != null) {
+            return evalInstanceOf(ctx);
+        }
+
         if (ctx.primary() != null) {
             return visit(ctx.primary());
         }
@@ -1014,6 +1019,44 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
 
         throw new EvalException("Unsupported cast type: " + typeName);
+    }
+
+    private Value evalInstanceOf(MiniJavaParser.ExpressionContext ctx) {
+        Value operand = visit(ctx.expression(0));
+        String targetTypeName = ctx.typeType().getText();
+
+        // Static checks: both must be class types in the same inheritance tree
+        // decl(obj) must be a class type
+        if (operand.kind() == Value.Kind.NULL) {
+            // null instanceof C → false (null is not an instance of any class)
+            return Value.ofBoolean(false);
+        }
+        if (operand.kind() != Value.Kind.CLASS) {
+            // e.g., arr instanceof C where arr is int[] → type error
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+        if (!classes.containsKey(targetTypeName)) {
+            // TargetType must be a class type (e.g., obj instanceof int[] → type error)
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        String declType = operand.getTypeName();
+        if (!isSameInheritanceTree(declType, targetTypeName)) {
+            // Unrelated class types → type error
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        // Runtime check: real(obj) is TargetType or a subclass of TargetType
+        ObjectInstance obj = operand.asClassObj();
+        if (obj == null) {
+            return Value.ofBoolean(false);
+        }
+        String realType = obj.className;
+        int dist = getInheritanceDistance(realType, targetTypeName);
+        return Value.ofBoolean(dist >= 0);
     }
 
     private Value evalArrayAccess(MiniJavaParser.ExpressionContext ctx) {
@@ -1616,7 +1659,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         if (rhs.kind() == Value.Kind.CLASS && classes.containsKey(typeName)) {
             ObjectInstance obj = rhs.asClassObj();
             if (obj != null && getInheritanceDistance(obj.className, typeName) >= 0) {
-                return rhs; // upcast is valid
+                return Value.ofClassObjWithType(obj, typeName); // upcast: update declared type
             }
         }
 
