@@ -5,8 +5,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     private static final class BreakSignal extends RuntimeException {
@@ -48,20 +51,101 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
     }
 
+    // ---- Lab 4: Class-related data structures ----
+
+    private static final class FieldInfo {
+        final String name;
+        final String typeName;
+        final boolean hasInitializer;
+        final MiniJavaParser.VariableInitializerContext initializerCtx;
+
+        FieldInfo(String name, String typeName, boolean hasInitializer,
+                  MiniJavaParser.VariableInitializerContext initializerCtx) {
+            this.name = name;
+            this.typeName = typeName;
+            this.hasInitializer = hasInitializer;
+            this.initializerCtx = initializerCtx;
+        }
+    }
+
+    private static final class ClassInfo {
+        final String name;
+        String parentName; // null if no parent (no extends)
+        final Map<String, FieldInfo> fields = new LinkedHashMap<>(); // preserve declaration order
+        final Map<String, List<MiniJavaParser.MethodDeclarationContext>> methods = new HashMap<>();
+        final List<MiniJavaParser.ConstructorDeclarationContext> constructors = new ArrayList<>();
+        boolean hasExplicitConstructor = false;
+
+        ClassInfo(String name) {
+            this.name = name;
+        }
+
+        /** Walk up the inheritance chain (including this class) to find the first class that declares field. */
+        FieldInfo findField(String fieldName) {
+            FieldInfo fi = fields.get(fieldName);
+            if (fi != null) return fi;
+            return null; // caller should walk superclass chain
+        }
+
+        /** Get all method candidates for a given name from this class only. */
+        List<MiniJavaParser.MethodDeclarationContext> getLocalMethods(String methodName) {
+            return methods.getOrDefault(methodName, Collections.emptyList());
+        }
+    }
+
     private final Deque<ScopeFrame> scopeStack = new ArrayDeque<>();
     private final Map<String, List<MiniJavaParser.MethodDeclarationContext>> methods = new HashMap<>();
+    private final Map<String, ClassInfo> classes = new LinkedHashMap<>(); // preserve declaration order
+    private ClassInfo currentClass = null; // class being parsed during registration
     private int loopDepth = 0;
     private String expectedArrayElementType = null; // for type-checking during array initialization
 
     @Override
     public Value visitCompilationUnit(MiniJavaParser.CompilationUnitContext ctx) {
-        // Collect all methods
+        // ---- Phase 1: Collect class declarations ----
+        for (MiniJavaParser.ClassDeclarationContext cd : ctx.classDeclaration()) {
+            String className = cd.identifier().getText();
+            if (classes.containsKey(className)) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+            ClassInfo ci = new ClassInfo(className);
+            if (cd.parentClassDeclaration() != null) {
+                ci.parentName = cd.parentClassDeclaration().identifier().getText();
+            }
+            classes.put(className, ci);
+        }
+
+        // ---- Phase 2: Validate inheritance & parse class bodies ----
+        for (MiniJavaParser.ClassDeclarationContext cd : ctx.classDeclaration()) {
+            String className = cd.identifier().getText();
+            ClassInfo ci = classes.get(className);
+
+            // Validate parent class exists
+            if (ci.parentName != null && !classes.containsKey(ci.parentName)) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            // Check for inheritance cycles
+            if (hasCyclicInheritance(className)) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            // Parse class body: collect fields, methods, constructors
+            currentClass = ci;
+            visitClassBody(cd.classBody());
+            currentClass = null;
+        }
+
+        // ---- Phase 3: Collect top-level methods ----
         for (MiniJavaParser.MethodDeclarationContext m : ctx.methodDeclaration()) {
             String name = m.identifier().getText();
             methods.computeIfAbsent(name, k -> new ArrayList<>()).add(m);
         }
 
-        // Find entry method main
+        // ---- Phase 4: Find entry method main ----
         List<MiniJavaParser.MethodDeclarationContext> mains = methods.getOrDefault("main", Collections.emptyList());
         MiniJavaParser.MethodDeclarationContext entryMethod = null;
         boolean ambiguous = false;
@@ -91,17 +175,14 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             System.exit(34);
         }
 
+        // ---- Phase 5: Execute main ----
         try {
-            // Use executeMethod for proper scope setup and return type checking
             Value mainRet = executeMethod(entryMethod, Collections.emptyList());
-            // If executeMethod returns normally, the method body completed without error
-            // (executeMethod already handles missing return by calling System.exit)
             if (mainRet != null && mainRet.kind() == Value.Kind.INT) {
                 int exitCode = (int) mainRet.asIntegral();
                 System.out.println("Process exits with " + exitCode + ".");
                 System.exit(exitCode);
             }
-            // Should not reach here - executeMethod handles errors internally
             System.out.println("Process exits with 34.");
             System.exit(34);
         } catch (EvalException ex) {
@@ -110,6 +191,19 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         }
 
         return null;
+    }
+
+    /** Check for cyclic inheritance starting from the given class. */
+    private boolean hasCyclicInheritance(String className) {
+        Set<String> visited = new HashSet<>();
+        String current = className;
+        while (current != null) {
+            if (!visited.add(current)) return true; // cycle detected
+            ClassInfo ci = classes.get(current);
+            if (ci == null) break;
+            current = ci.parentName;
+        }
+        return false;
     }
 
     @Override
@@ -191,7 +285,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             }
             String typeName;
             Value.Kind declaredType = value.kind();
-            if (declaredType == Value.Kind.ARRAY) {
+            if (declaredType == Value.Kind.ARRAY || declaredType == Value.Kind.CLASS) {
                 typeName = value.getTypeName();
             } else {
                 typeName = Value.kindName(declaredType);
@@ -204,12 +298,7 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         } else {
             // Typed declaration
             String typeStr = ctx.typeType().getText();
-            Value.Kind declaredType;
-            if (typeStr.endsWith("[]")) {
-                declaredType = Value.Kind.ARRAY;
-            } else {
-                declaredType = parsePrimitiveType(typeStr);
-            }
+            Value.Kind declaredType = resolveTypeKind(typeStr);
 
             MiniJavaParser.VariableDeclaratorContext varCtx = ctx.variableDeclarator();
             String identifier = varCtx.identifier().getText();
@@ -1005,6 +1094,17 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             throw new EvalException("Type mismatch for array assignment.");
         }
 
+        if (targetType == Value.Kind.CLASS) {
+            // Class type assignment: allow null or same/subclass type
+            if (rhs.kind() == Value.Kind.NULL) {
+                return rhs; // null assignable to any class type
+            }
+            if (rhs.kind() == Value.Kind.CLASS) {
+                return rhs; // upcast is checked elsewhere (implicitly allowed)
+            }
+            throw new EvalException("Type mismatch for class assignment.");
+        }
+
         throw new EvalException("Unsupported assignment target type.");
     }
 
@@ -1196,6 +1296,13 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
         };
     }
 
+    /** Resolve a type name to its Kind, handling primitives, arrays, and class types. */
+    private Value.Kind resolveTypeKind(String typeStr) {
+        if (typeStr.endsWith("[]")) return Value.Kind.ARRAY;
+        if (classes.containsKey(typeStr)) return Value.Kind.CLASS;
+        return parsePrimitiveType(typeStr);
+    }
+
     /** Infer the type of an expression without side effects (for var null inference) */
     private String inferExpressionType(MiniJavaParser.ExpressionContext ctx) {
         if (ctx.primary() != null && ctx.primary().identifier() != null) {
@@ -1218,12 +1325,14 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             case BOOLEAN -> Value.ofBoolean(false);
             case STRING -> Value.ofString("");
             case ARRAY -> Value.ofNull();
+            case CLASS -> Value.ofNull();
             case NULL -> Value.ofNull();
         };
     }
 
     private Value defaultValueForTypeName(String typeName) {
         if (typeName.endsWith("[]")) return Value.ofNull();
+        if (classes.containsKey(typeName)) return Value.ofNull(); // class types default to null
         return defaultValueForType(parsePrimitiveType(typeName));
     }
 
@@ -1251,6 +1360,17 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
 
         // null → any array type
         if (rhsType.equals("null") && typeName.endsWith("[]")) return Value.ofNull();
+
+        // null → any class type
+        if (rhsType.equals("null") && classes.containsKey(typeName)) return Value.ofNull();
+
+        // Class type assignment: subclass → superclass (upcast)
+        if (rhs.kind() == Value.Kind.CLASS && classes.containsKey(typeName)) {
+            ObjectInstance obj = rhs.asClassObj();
+            if (obj != null && getInheritanceDistance(obj.className, typeName) >= 0) {
+                return rhs; // upcast is valid
+            }
+        }
 
         // Array assignment: types must match exactly (no cross-type array assignment)
         if (rhs.kind() == Value.Kind.ARRAY && typeName.endsWith("[]")) {
@@ -1366,11 +1486,33 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
     @Override
     public Value visitCreator(MiniJavaParser.CreatorContext ctx) {
         String baseType = ctx.createdName().getText();
+
+        // ---- Class instantiation: new ClassName(args...) ----
+        if (ctx.classCreatorRest() != null) {
+            ClassInfo ci = classes.get(baseType);
+            if (ci == null) {
+                System.out.println("Process exits with 34.");
+                System.exit(34);
+            }
+
+            // Evaluate arguments
+            List<Value> args = new ArrayList<>();
+            MiniJavaParser.ExpressionListContext exprList = ctx.classCreatorRest().expressionList();
+            if (exprList != null) {
+                for (MiniJavaParser.ExpressionContext argCtx : exprList.expression()) {
+                    args.add(visit(argCtx));
+                }
+            }
+
+            // Find matching constructor
+            MiniJavaParser.ConstructorDeclarationContext ctor = findConstructor(ci, args);
+            return executeConstructor(ci, ctor, args);
+        }
+
+        // ---- Array creation ----
         MiniJavaParser.ArrayCreatorRestContext rest = ctx.arrayCreatorRest();
         if (rest.arrayInitializer() != null) {
             Value init = visit(rest.arrayInitializer());
-            // Count dimensions from '[' ']' pairs, but only those BEFORE the array initializer.
-            // Do NOT count '[' inside char/string literals within the initializer.
             int dimensions = countArrayDimensions(rest.getText());
             StringBuilder typeStr = new StringBuilder(baseType);
             for (int i = 0; i < dimensions; i++) typeStr.append("[]");
@@ -1466,5 +1608,501 @@ public class EvalVisitor extends MiniJavaParserBaseVisitor<Value> {
             case "String", "string" -> Value.Kind.STRING;
             default -> throw new EvalException("Unknown kind: " + typeStr);
         };
+    }
+
+    // ========== Lab 4: Class-related visitor methods ==========
+
+    @Override
+    public Value visitClassDeclaration(MiniJavaParser.ClassDeclarationContext ctx) {
+        // Handled by visitCompilationUnit; this is a no-op for direct visits.
+        return null;
+    }
+
+    @Override
+    public Value visitClassBody(MiniJavaParser.ClassBodyContext ctx) {
+        for (MiniJavaParser.ClassBodyDeclarationContext decl : ctx.classBodyDeclaration()) {
+            visitClassBodyDeclaration(decl);
+        }
+        return null;
+    }
+
+    @Override
+    public Value visitClassBodyDeclaration(MiniJavaParser.ClassBodyDeclarationContext ctx) {
+        if (ctx.fieldDeclaration() != null) {
+            visitFieldDeclaration(ctx.fieldDeclaration());
+        } else if (ctx.methodDeclaration() != null) {
+            // Collect method into current class
+            MiniJavaParser.MethodDeclarationContext md = ctx.methodDeclaration();
+            String methodName = md.identifier().getText();
+            currentClass.methods.computeIfAbsent(methodName, k -> new ArrayList<>()).add(md);
+        } else if (ctx.constructorDeclaration() != null) {
+            visitConstructorDeclaration(ctx.constructorDeclaration());
+        }
+        // ';' is ignored
+        return null;
+    }
+
+    @Override
+    public Value visitFieldDeclaration(MiniJavaParser.FieldDeclarationContext ctx) {
+        String typeStr = ctx.typeType().getText();
+        MiniJavaParser.VariableDeclaratorContext varCtx = ctx.variableDeclarator();
+        String fieldName = varCtx.identifier().getText();
+
+        boolean hasInit = varCtx.variableInitializer() != null;
+        MiniJavaParser.VariableInitializerContext initCtx = hasInit ? varCtx.variableInitializer() : null;
+
+        FieldInfo fi = new FieldInfo(fieldName, typeStr, hasInit, initCtx);
+        if (currentClass.fields.containsKey(fieldName)) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+        currentClass.fields.put(fieldName, fi);
+        return null;
+    }
+
+    @Override
+    public Value visitConstructorDeclaration(MiniJavaParser.ConstructorDeclarationContext ctx) {
+        currentClass.constructors.add(ctx);
+        currentClass.hasExplicitConstructor = true;
+        return null;
+    }
+
+    // ========== Helper: check if a type name refers to a known class ==========
+
+    /** Returns true if typeName is a known class (not primitive, not array). */
+    private boolean isClassType(String typeName) {
+        return classes.containsKey(typeName);
+    }
+
+    /** Get the ClassInfo for a given class name, or null if not a class. */
+    private ClassInfo getClassInfo(String typeName) {
+        return classes.get(typeName);
+    }
+
+    // ========== Task 3: Object Creation & Constructors ==========
+
+    /** The object currently being constructed (used during field init and constructor body). */
+    private ObjectInstance currentObject = null;
+
+    /**
+     * Find the best matching constructor for the given arguments using overload resolution.
+     * If no explicit constructor matches, returns the implicit default constructor (or null if none).
+     */
+    private MiniJavaParser.ConstructorDeclarationContext findConstructor(ClassInfo ci, List<Value> args) {
+        MiniJavaParser.ConstructorDeclarationContext best = null;
+        int bestCost = Integer.MAX_VALUE;
+        boolean ambiguous = false;
+
+        for (MiniJavaParser.ConstructorDeclarationContext c : ci.constructors) {
+            List<MiniJavaParser.FormalParameterContext> params =
+                (c.formalParameters().formalParameterList() != null)
+                    ? c.formalParameters().formalParameterList().formalParameter()
+                    : Collections.emptyList();
+
+            if (params.size() != args.size()) continue;
+
+            int currentCost = 0;
+            boolean compatible = true;
+            for (int i = 0; i < args.size(); i++) {
+                String paramType = params.get(i).typeType().getText();
+                int cost = getArgConversionCost(args.get(i), paramType);
+                if (cost == -1) {
+                    compatible = false;
+                    break;
+                }
+                currentCost += cost;
+            }
+
+            if (compatible) {
+                if (currentCost < bestCost) {
+                    bestCost = currentCost;
+                    best = c;
+                    ambiguous = false;
+                } else if (currentCost == bestCost) {
+                    ambiguous = true;
+                }
+            }
+        }
+
+        if (ambiguous) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        }
+
+        if (best != null) return best;
+
+        // No matching explicit constructor → use implicit default if args is empty
+        if (args.isEmpty()) {
+            return null; // signal to use implicit default constructor
+        }
+
+        System.out.println("Process exits with 34.");
+        System.exit(34);
+        return null;
+    }
+
+    /**
+     * Execute a constructor using the 4-step process:
+     * Step 1: explicit this(...) / super(...)
+     * Step 2: implicit super() if no explicit delegation
+     * Step 3: field initializers (if no this() delegation)
+     * Step 4: remaining constructor body
+     */
+    private Value executeConstructor(ClassInfo ci, MiniJavaParser.ConstructorDeclarationContext ctor,
+                                      List<Value> args) {
+        // Allocate and zero-initialize the object
+        ObjectInstance obj = allocateAndZeroFields(ci);
+        ObjectInstance savedObj = this.currentObject;
+        this.currentObject = obj;
+
+        // Save and restore scope state (constructor body runs in its own scope)
+        Deque<ScopeFrame> savedStack = new ArrayDeque<>(scopeStack);
+        scopeStack.clear();
+        enterScope();
+
+        try {
+            // Bind parameters
+            if (ctor != null) {
+                List<MiniJavaParser.FormalParameterContext> params =
+                    (ctor.formalParameters().formalParameterList() != null)
+                        ? ctor.formalParameters().formalParameterList().formalParameter()
+                        : Collections.emptyList();
+                for (int i = 0; i < params.size(); i++) {
+                    String pName = params.get(i).identifier().getText();
+                    String pTypeStr = params.get(i).typeType().getText();
+                    Value argVal = args.get(i);
+                    argVal = applyArgConversion(argVal, pTypeStr);
+                    currentScope().variables.put(pName,
+                        new VariableBinding(argVal.kind(), pTypeStr, argVal));
+                }
+            }
+
+            // Execute the 4-step constructor process
+            executeConstructorBody(ci, ctor);
+
+        } catch (EvalException ex) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        } finally {
+            scopeStack.clear();
+            scopeStack.addAll(savedStack);
+            this.currentObject = savedObj;
+        }
+
+        return Value.ofClassObj(obj);
+    }
+
+    /**
+     * Execute the constructor body following the 4-step process:
+     * 1. Detect and handle this(...)/super(...) as first statement
+     * 2. If no explicit delegation, call implicit super() on parent
+     * 3. If no this() delegation, execute field initializers
+     * 4. Execute remaining constructor body statements
+     */
+    private void executeConstructorBody(ClassInfo ci, MiniJavaParser.ConstructorDeclarationContext ctor) {
+        MiniJavaParser.BlockContext block = (ctor != null) ? ctor.block() : null;
+        List<MiniJavaParser.BlockStatementContext> statements = (block != null)
+            ? block.blockStatement() : Collections.emptyList();
+
+        int startIdx = 0;
+        boolean didExplicitDelegation = false;
+        boolean didThisDelegation = false;
+
+        // ---- Step 1: Check for explicit this(...) / super(...) as first statement ----
+        if (!statements.isEmpty()) {
+            MiniJavaParser.BlockStatementContext first = statements.get(0);
+            String delegationType = detectConstructorDelegation(first);
+            if (delegationType != null) {
+                didExplicitDelegation = true;
+                startIdx = 1;
+
+                MiniJavaParser.ExpressionContext expr = first.statement().expression();
+                MiniJavaParser.MethodCallContext callCtx = expr.methodCall();
+                List<Value> delegationArgs = new ArrayList<>();
+                if (callCtx.arguments().expressionList() != null) {
+                    for (MiniJavaParser.ExpressionContext argCtx
+                         : callCtx.arguments().expressionList().expression()) {
+                        delegationArgs.add(visit(argCtx));
+                    }
+                }
+
+                if ("this".equals(delegationType)) {
+                    didThisDelegation = true;
+                    // Find another constructor in the same class
+                    MiniJavaParser.ConstructorDeclarationContext targetCtor =
+                        findConstructor(ci, delegationArgs);
+                    // Execute the target constructor on the same object
+                    executeConstructorDelegated(ci, targetCtor, delegationArgs, currentObject);
+                } else { // "super"
+                    ClassInfo superCi = classes.get(ci.parentName);
+                    if (superCi == null) {
+                        System.out.println("Process exits with 34.");
+                        System.exit(34);
+                    }
+                    MiniJavaParser.ConstructorDeclarationContext superCtor =
+                        findConstructor(superCi, delegationArgs);
+                    executeSuperConstructor(superCi, superCtor, delegationArgs);
+                }
+            }
+        }
+
+        // ---- Step 2: Implicit super() if no explicit delegation ----
+        if (!didExplicitDelegation && ci.parentName != null) {
+            ClassInfo superCi = classes.get(ci.parentName);
+            // Call default constructor of superclass
+            executeSuperConstructor(superCi, null, Collections.emptyList());
+        }
+
+        // ---- Step 3: Field initializers (only if no this() delegation) ----
+        if (!didThisDelegation) {
+            initFields(ci);
+        }
+
+        // ---- Step 4: Execute remaining constructor body ----
+        if (ctor != null && block != null) {
+            for (int i = startIdx; i < statements.size(); i++) {
+                visit(statements.get(i));
+            }
+        }
+    }
+
+    /**
+     * Execute a constructor that was delegated to via this(...).
+     * The object is already allocated; we skip allocation and field init for the
+     * delegated constructor's own class (since the outer constructor handles it).
+     */
+    private void executeConstructorDelegated(ClassInfo ci, MiniJavaParser.ConstructorDeclarationContext ctor,
+                                              List<Value> args, ObjectInstance obj) {
+        ObjectInstance savedObj = this.currentObject;
+        this.currentObject = obj;
+
+        Deque<ScopeFrame> savedStack = new ArrayDeque<>(scopeStack);
+        scopeStack.clear();
+        enterScope();
+
+        try {
+            // Bind parameters
+            List<MiniJavaParser.FormalParameterContext> params =
+                (ctor.formalParameters().formalParameterList() != null)
+                    ? ctor.formalParameters().formalParameterList().formalParameter()
+                    : Collections.emptyList();
+            for (int i = 0; i < params.size(); i++) {
+                String pName = params.get(i).identifier().getText();
+                String pTypeStr = params.get(i).typeType().getText();
+                Value argVal = args.get(i);
+                argVal = applyArgConversion(argVal, pTypeStr);
+                currentScope().variables.put(pName,
+                    new VariableBinding(argVal.kind(), pTypeStr, argVal));
+            }
+
+            // Recurse: executeConstructorBody with the delegated constructor
+            executeConstructorBody(ci, ctor);
+
+        } catch (EvalException ex) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        } finally {
+            scopeStack.clear();
+            scopeStack.addAll(savedStack);
+            this.currentObject = savedObj;
+        }
+    }
+
+    /**
+     * Execute a superclass constructor. The currentObject must already be allocated.
+     * This handles the super() call (explicit or implicit).
+     */
+    private void executeSuperConstructor(ClassInfo superCi,
+                                          MiniJavaParser.ConstructorDeclarationContext superCtor,
+                                          List<Value> args) {
+        ObjectInstance savedObj = this.currentObject;
+        // currentObject stays the same (same object, superclass init)
+
+        Deque<ScopeFrame> savedStack = new ArrayDeque<>(scopeStack);
+        scopeStack.clear();
+        enterScope();
+
+        try {
+            // Bind parameters
+            if (superCtor != null) {
+                List<MiniJavaParser.FormalParameterContext> params =
+                    (superCtor.formalParameters().formalParameterList() != null)
+                        ? superCtor.formalParameters().formalParameterList().formalParameter()
+                        : Collections.emptyList();
+                for (int i = 0; i < params.size(); i++) {
+                    String pName = params.get(i).identifier().getText();
+                    String pTypeStr = params.get(i).typeType().getText();
+                    Value argVal = args.get(i);
+                    argVal = applyArgConversion(argVal, pTypeStr);
+                    currentScope().variables.put(pName,
+                        new VariableBinding(argVal.kind(), pTypeStr, argVal));
+                }
+            }
+
+            // Execute the superclass constructor body
+            executeConstructorBody(superCi, superCtor);
+
+        } catch (EvalException ex) {
+            System.out.println("Process exits with 34.");
+            System.exit(34);
+        } finally {
+            scopeStack.clear();
+            scopeStack.addAll(savedStack);
+            this.currentObject = savedObj;
+        }
+    }
+
+    /**
+     * Detect if the first statement is a constructor delegation: this(...) or super(...).
+     * Returns "this", "super", or null.
+     */
+    private String detectConstructorDelegation(MiniJavaParser.BlockStatementContext stmt) {
+        if (stmt.statement() == null) return null;
+        MiniJavaParser.StatementContext s = stmt.statement();
+        if (s.expression() == null) return null;
+        MiniJavaParser.ExpressionContext expr = s.expression();
+        if (expr.methodCall() == null) return null;
+        MiniJavaParser.MethodCallContext call = expr.methodCall();
+        if (call.THIS() != null) return "this";
+        if (call.SUPER() != null) return "super";
+        return null;
+    }
+
+    /**
+     * Allocate an object and zero-initialize ALL fields across the entire
+     * inheritance chain (from the topmost superclass down to the given class).
+     */
+    private ObjectInstance allocateAndZeroFields(ClassInfo ci) {
+        // Build inheritance chain from top to bottom
+        List<ClassInfo> chain = new ArrayList<>();
+        ClassInfo current = ci;
+        while (current != null) {
+            chain.add(current);
+            current = classes.get(current.parentName);
+        }
+        // Reverse to get top-down order
+        Collections.reverse(chain);
+
+        ObjectInstance obj = new ObjectInstance(ci.name);
+
+        // Zero all fields in top-down order
+        for (ClassInfo c : chain) {
+            for (FieldInfo fi : c.fields.values()) {
+                Value defaultVal;
+                if (fi.typeName.endsWith("[]") || classes.containsKey(fi.typeName)) {
+                    defaultVal = Value.ofNull();
+                } else {
+                    defaultVal = defaultValueForTypeName(fi.typeName);
+                }
+                obj.fields.put(fi.name, defaultVal);
+            }
+        }
+
+        return obj;
+    }
+
+    /**
+     * Execute field initializers for the given class on the current object.
+     * Fields are initialized in declaration order.
+     */
+    private void initFields(ClassInfo ci) {
+        for (FieldInfo fi : ci.fields.values()) {
+            if (fi.hasInitializer) {
+                // Evaluate the initializer expression
+                Value initVal = visit(fi.initializerCtx);
+
+                // Apply type checking
+                if (fi.typeName.endsWith("[]") || classes.containsKey(fi.typeName)) {
+                    // Array or class type
+                    if (initVal.kind() == Value.Kind.NULL) {
+                        // OK, null is valid
+                    } else if (fi.typeName.endsWith("[]") && initVal.kind() == Value.Kind.ARRAY) {
+                        initVal = applyTypeCheckedAssignment(fi.typeName, initVal);
+                    } else if (classes.containsKey(fi.typeName) && initVal.kind() == Value.Kind.CLASS) {
+                        // Check class type compatibility
+                        initVal = applyTypeCheckedAssignment(fi.typeName, initVal);
+                    } else {
+                        System.out.println("Process exits with 34.");
+                        System.exit(34);
+                    }
+                } else {
+                    // Primitive type
+                    initVal = applyTypeCheckedAssignment(fi.typeName, initVal);
+                }
+
+                currentObject.fields.put(fi.name, initVal);
+            }
+        }
+    }
+
+    /**
+     * Conversion cost for method/constructor argument matching.
+     * For class types, cost = inheritance distance (0 = same class, 1 = direct superclass, etc.)
+     */
+    private int getArgConversionCost(Value arg, String formalParamType) {
+        String argType = arg.getTypeName();
+
+        // Exact match
+        if (argType.equals(formalParamType)) return 0;
+
+        // char → int
+        if (argType.equals("char") && formalParamType.equals("int")) return 1;
+
+        // null → any array type or class type
+        if (argType.equals("null") && (formalParamType.endsWith("[]") || classes.containsKey(formalParamType)))
+            return 1;
+
+        // Class upcast: subclass → superclass
+        if (arg.kind() == Value.Kind.CLASS && classes.containsKey(formalParamType)) {
+            ObjectInstance obj = arg.asClassObj();
+            if (obj != null) {
+                int dist = getInheritanceDistance(obj.className, formalParamType);
+                if (dist >= 0) return dist;
+            }
+        }
+
+        // null → class type (handled above via argType.equals("null"))
+        return -1;
+    }
+
+    /** Apply argument conversion (e.g., char→int widening) for constructor/method parameters. */
+    private Value applyArgConversion(Value arg, String paramType) {
+        if (arg.getTypeName().equals("char") && paramType.equals("int")) {
+            return Value.ofInt(arg.asIntegral());
+        }
+        if (arg.isDecimalLiteral()) {
+            return Value.ofInt(arg.asIntegral());
+        }
+        return arg;
+    }
+
+    /**
+     * Calculate inheritance distance from subclass to superclass.
+     * Returns 0 if same class, 1 if direct subclass, etc.
+     * Returns -1 if subclass is not actually a subclass of superclass.
+     */
+    private int getInheritanceDistance(String subClassName, String superClassName) {
+        if (subClassName.equals(superClassName)) return 0;
+        int distance = 0;
+        String current = subClassName;
+        while (current != null) {
+            ClassInfo ci = classes.get(current);
+            if (ci == null) break;
+            current = ci.parentName;
+            distance++;
+            if (superClassName.equals(current)) return distance;
+        }
+        return -1;
+    }
+
+    /**
+     * Check if two class types belong to the same inheritance tree
+     * (i.e., one is reachable from the other via extends chain).
+     */
+    private boolean isSameInheritanceTree(String classA, String classB) {
+        // Check if A is ancestor of B or B is ancestor of A
+        if (getInheritanceDistance(classA, classB) >= 0) return true;
+        if (getInheritanceDistance(classB, classA) >= 0) return true;
+        return false;
     }
 }

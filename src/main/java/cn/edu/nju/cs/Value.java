@@ -7,6 +7,7 @@ final class Value {
         BOOLEAN,
         STRING,
         ARRAY,
+        CLASS,
         NULL
     }
 
@@ -56,6 +57,10 @@ final class Value {
         return new Value(Kind.ARRAY, elements, typeName, false);
     }
 
+    static Value ofClassObj(ObjectInstance obj) {
+        return new Value(Kind.CLASS, obj, obj.className, false);
+    }
+
     Kind kind() {
         return kind;
     }
@@ -79,6 +84,7 @@ final class Value {
             case BOOLEAN -> "boolean";
             case STRING -> "string";
             case ARRAY -> "array";
+            case CLASS -> "class";
             case NULL -> "null";
         };
     }
@@ -111,6 +117,10 @@ final class Value {
     String toConcatString() {
         if (kind == Kind.NULL) return "null";
         if (kind == Kind.ARRAY) return arrayToString((Value[]) value);
+        if (kind == Kind.CLASS) {
+            ObjectInstance obj = (ObjectInstance) value;
+            return obj == null ? "null" : obj.className;
+        }
         return switch (kind) {
             case INT -> Integer.toString((Integer) value);
             case CHAR -> Character.toString((char) (((Integer) value) & 0xFF));
@@ -123,6 +133,10 @@ final class Value {
     String displayString() {
         if (kind == Kind.NULL) return "null";
         if (kind == Kind.ARRAY) return arrayToString((Value[]) value);
+        if (kind == Kind.CLASS) {
+            ObjectInstance obj = (ObjectInstance) value;
+            return obj == null ? "null" : obj.className;
+        }
         return switch (kind) {
             case INT -> Integer.toString((Integer) value);
             case CHAR -> Character.toString((char) (((Integer) value) & 0xFF));
@@ -142,6 +156,19 @@ final class Value {
         }
         sb.append("]");
         return sb.toString();
+    }
+
+    /** Returns the ObjectInstance for CLASS values, or null. */
+    ObjectInstance asClassObj() {
+        if (kind == Kind.NULL) return null;
+        if (kind != Kind.CLASS) {
+            throw new EvalException("Class object value required.");
+        }
+        return (ObjectInstance) value;
+    }
+
+    boolean isClassType() {
+        return kind == Kind.CLASS || kind == Kind.NULL;
     }
 
     static Value rewrapArrayType(Value arrayVal, String typeName) {
